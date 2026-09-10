@@ -107,4 +107,8 @@ Once Paperclip is running, this wrapper is transparent — it just passes throug
 → Ensure the service is running the latest image so `@google/gemini-cli` is installed, set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Railway variables, then redeploy/restart. The image disables Gemini's nested sandbox so ACP runs inherit this key.
 
 **Dashboard reports Minified React error #185**
-→ Deploy the latest template revision so Railway rebuilds the pinned Paperclip release instead of reusing an earlier UI bundle, then reload after the service is healthy. This release contains the upstream fixes for the known maximum-update-depth crash paths.
+→ Restart or redeploy the service, then reload after it is healthy. The wrapper checks for and installs the newest Paperclip release on every startup, so it automatically receives upstream UI fixes.
+
+## Paperclip updates
+
+Paperclip is intentionally declared as `latest` and refreshed on every container start. Do not pin its version: new upstream releases are applied automatically on Railway restarts and redeploys.

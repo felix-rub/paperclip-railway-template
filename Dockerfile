@@ -15,14 +15,9 @@ RUN mkdir -p /paperclip && chown -R paperclip:paperclip /paperclip
 
 WORKDIR /app
 
-# Changing this pin intentionally invalidates Railway's dependency layer so the
-# image cannot retain an earlier Paperclip UI bundle.
-ARG PAPERCLIP_VERSION=2026.831.1
-
 # Copy package files and install dependencies
 COPY package.json ./
-RUN npm install --omit=dev \
-    && test "$(node -p "require('./node_modules/paperclipai/package.json').version")" = "$PAPERCLIP_VERSION"
+RUN npm install --omit=dev
 
 # Copy application code
 COPY . .

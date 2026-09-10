@@ -8,7 +8,7 @@
     "build": "echo 'No build step required'"
   },
   "dependencies": {
-    "paperclipai": "2026.831.1",
+    "paperclipai": "latest",
     "@anthropic-ai/claude-code": "latest",
     "@openai/codex": "latest",
     "@google/gemini-cli": "latest",
