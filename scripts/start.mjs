@@ -19,7 +19,7 @@
 
 import { createServer, request as httpRequest } from "http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
-import { spawn } from "child_process";
+import { spawn, spawnSync } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
@@ -32,6 +32,7 @@ const HOME = process.env.PAPERCLIP_HOME || "/paperclip";
 const CONFIG_PATH = join(HOME, "config.json");
 const INVITE_FILE = join(HOME, "bootstrap-invite.txt");
 const SKIP_REASON_FILE = join(HOME, "bootstrap-skip-reason.txt");
+const APP_ROOT = join(__dirname, "..");
 
 // Shared Codex home — Paperclip's codex adapter seeds each company's managed
 // Codex home from here (it mirrors @paperclipai's resolveSharedCodexHomeDir).
@@ -66,6 +67,20 @@ function isReady() {
 
 function allEnvVarsSet() {
   return REQUIRED_VARS.every(k => !!process.env[k]);
+}
+
+// A Docker dependency layer can be reused after Paperclip releases a new version.
+// Refresh on boot so every Railway restart runs the current `latest` release.
+function updatePaperclip() {
+  console.log("🔄 Checking for the latest Paperclip release...");
+  const result = spawnSync(
+    process.execPath,
+    [process.env.npm_execpath || "node_modules/npm/bin/npm-cli.js", "install", "--omit=dev", "--no-save", "--package-lock=false", "paperclipai@latest"],
+    { cwd: APP_ROOT, stdio: "inherit" },
+  );
+  if (result.error || result.status !== 0) {
+    console.warn(`⚠️ Could not refresh Paperclip; using the installed release.${result.error ? ` ${result.error.message}` : ""}`);
+  }
 }
 
 // ── Config builder ────────────────────────────────────────────────────────────
@@ -453,6 +468,7 @@ function startServer() {
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
+updatePaperclip();
 startServer();
 
 if (isReady()) {
