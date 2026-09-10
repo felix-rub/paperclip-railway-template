@@ -112,3 +112,16 @@ Once Paperclip is running, this wrapper is transparent — it just passes throug
 ## Paperclip updates
 
 Paperclip is intentionally declared as `latest` and refreshed on every container start. Do not pin its version: new upstream releases are applied automatically on Railway restarts and redeploys.
+
+## Keeping this fork up to date
+
+While the `paperclipai` package itself auto-updates on every restart (see above), breaking changes upstream — a new required config key, a bumped Node.js requirement, a changed CLI flag — can still break the Railway deployment until this wrapper (`Dockerfile`, `entrypoint.sh`, `scripts/start.mjs`) is adjusted for it. The same applies to fixes landing in the template this repo was forked from, [praveen-ks-2001/paperclip-railway-template](https://github.com/praveen-ks-2001/paperclip-railway-template).
+
+The [`.github/workflows/upstream-watch.yml`](.github/workflows/upstream-watch.yml) workflow automates catching and fixing these:
+
+1. It runs daily (and on manual `workflow_dispatch`), checking for a new `paperclipai` npm release and new commits on the upstream template's `main` branch, against the last-seen values recorded in `.github/upstream-state.json`.
+2. If either changed, it opens a GitHub issue summarizing what's new and asking for the necessary Railway-compatibility fixes.
+3. It assigns that issue to the **Copilot coding agent**, which investigates and opens a pull request with the fixes.
+4. It records the new versions in `.github/upstream-state.json` so the next run only reports genuinely new changes.
+
+**Setup**: assigning issues to Copilot via the API requires a user token from a Copilot-licensed account (the workflow's default `GITHUB_TOKEN` can't hold a Copilot seat). Create a personal access token with `repo` scope from such an account and add it as the `COPILOT_PAT` repository secret. Without it, the workflow still opens the issue — just without the automatic assignment — so it can be assigned to Copilot manually.

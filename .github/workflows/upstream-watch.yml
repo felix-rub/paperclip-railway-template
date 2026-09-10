@@ -1,0 +1,158 @@
+name: Watch for Paperclip & upstream template updates
+
+# Keeps this Railway wrapper current with:
+#   1. New releases of the `paperclipai` npm package (the app this wraps).
+#   2. New commits on the upstream template repo this project is forked from
+#      (praveen-ks-2001/paperclip-railway-template).
+#
+# When either changes, it opens a GitHub issue summarizing what changed and
+# assigns it to the Copilot coding agent so it can apply whatever fixes are
+# needed to keep the Railway deployment (Dockerfile, entrypoint, start
+# script) working, then opens a PR.
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily at 06:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: praveen-ks-2001/paperclip-railway-template
+  UPSTREAM_BRANCH: main
+  STATE_FILE: .github/upstream-state.json
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  check-for-updates:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Read previous state
+        id: prev
+        run: |
+          if [ -f "$STATE_FILE" ]; then
+            echo "paperclip_version=$(jq -r '.paperclipai_version // empty' "$STATE_FILE")" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=$(jq -r '.upstream_sha // empty' "$STATE_FILE")" >> "$GITHUB_OUTPUT"
+          else
+            echo "paperclip_version=" >> "$GITHUB_OUTPUT"
+            echo "upstream_sha=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Get latest paperclipai version
+        id: paperclip
+        run: echo "version=$(npm view paperclipai version)" >> "$GITHUB_OUTPUT"
+
+      - name: Get latest upstream template commit
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(gh api "repos/${UPSTREAM_REPO}/commits/${UPSTREAM_BRANCH}" --jq '.sha')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
+      - name: Determine if an update is available
+        id: diff
+        run: |
+          changed=false
+          if [ -n "${{ steps.prev.outputs.paperclip_version }}" ] && \
+             [ "${{ steps.paperclip.outputs.version }}" != "${{ steps.prev.outputs.paperclip_version }}" ]; then
+            changed=true
+            echo "paperclip_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -n "${{ steps.prev.outputs.upstream_sha }}" ] && \
+             [ "${{ steps.upstream.outputs.sha }}" != "${{ steps.prev.outputs.upstream_sha }}" ]; then
+            changed=true
+            echo "upstream_changed=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+      - name: Build issue body
+        if: steps.diff.outputs.changed == 'true'
+        id: body
+        run: |
+          {
+            echo "body<<ISSUE_BODY_EOF"
+            echo "Automated check found upstream updates that may need to be applied to keep this Railway wrapper working."
+            echo
+            if [ "${{ steps.diff.outputs.paperclip_changed }}" == "true" ]; then
+              echo "### paperclipai npm package"
+              echo "- Previous tracked version: \`${{ steps.prev.outputs.paperclip_version }}\`"
+              echo "- Latest version: \`${{ steps.paperclip.outputs.version }}\`"
+              echo "- https://www.npmjs.com/package/paperclipai/v/${{ steps.paperclip.outputs.version }}"
+              echo
+            fi
+            if [ "${{ steps.diff.outputs.upstream_changed }}" == "true" ]; then
+              echo "### Upstream template (${{ env.UPSTREAM_REPO }})"
+              echo "- Previous tracked commit: \`${{ steps.prev.outputs.upstream_sha }}\`"
+              echo "- Latest commit: \`${{ steps.upstream.outputs.sha }}\`"
+              echo "- Compare: https://github.com/${{ env.UPSTREAM_REPO }}/compare/${{ steps.prev.outputs.upstream_sha }}...${{ steps.upstream.outputs.sha }}"
+              echo
+            fi
+            echo "### Requested action"
+            echo "Please review the changes above and apply whatever fixes are necessary so this repository keeps deploying cleanly on Railway:"
+            echo "- Update \`Dockerfile\`, \`entrypoint.sh\`, and \`scripts/start.mjs\` for any breaking changes (e.g. new Node.js version requirements, changed CLI flags, new required config keys or environment variables)."
+            echo "- Port over relevant upstream template fixes that aren't already present in this fork."
+            echo "- Keep the \`paperclipai\` dependency on \`latest\` (do not pin it)."
+            echo "- Update \`README.md\` if setup/troubleshooting steps changed."
+            echo "- Open a pull request with the fixes."
+            echo "ISSUE_BODY_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create update issue
+        if: steps.diff.outputs.changed == 'true'
+        id: create_issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          issue_url=$(gh issue create \
+            --title "Upstream update available: keep Railway deployment current" \
+            --body "${{ steps.body.outputs.body }}")
+          echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
+          echo "issue_number=$(basename "$issue_url")" >> "$GITHUB_OUTPUT"
+
+      # Assigning an issue to the Copilot coding agent requires a user token
+      # (the default GITHUB_TOKEN belongs to a bot and cannot hold a Copilot
+      # seat). Add a personal access token from a Copilot-licensed account as
+      # the COPILOT_PAT repository secret to enable this step. Without it,
+      # the issue above is still created for a human to assign manually.
+      - name: Assign Copilot coding agent
+        if: steps.diff.outputs.changed == 'true' && secrets.COPILOT_PAT != ''
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${{ github.repository }}/issues/${{ steps.create_issue.outputs.issue_number }}/assignees" \
+            -f "assignees[]=copilot-swe-agent[bot]"
+
+      - name: Update state file
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          jq -n \
+            --arg v "${{ steps.paperclip.outputs.version }}" \
+            --arg s "${{ steps.upstream.outputs.sha }}" \
+            '{paperclipai_version: $v, upstream_sha: $s}' > "$STATE_FILE"
+
+      - name: Commit updated state
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "$STATE_FILE"
+          git diff --cached --quiet || git commit -m "chore: record latest paperclip/upstream versions [skip ci]"
+          git push
