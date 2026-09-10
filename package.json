@@ -8,12 +8,12 @@
     "build": "echo 'No build step required'"
   },
   "dependencies": {
-    "paperclipai": "latest",
+    "paperclipai": "2026.831.1",
     "@anthropic-ai/claude-code": "latest",
     "@openai/codex": "latest",
     "opencode-ai": "latest"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24.11.0"
   }
 }
