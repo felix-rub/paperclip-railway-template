@@ -14,6 +14,6 @@
     "opencode-ai": "latest"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24.11.0"
   }
 }
