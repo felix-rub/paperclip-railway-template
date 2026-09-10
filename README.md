@@ -116,6 +116,12 @@ Once Paperclip is running, this wrapper is transparent — it proxies public tra
 **OpenCode adapter probe fails with `opencode: command not found`**
 → Ensure the service was deployed with the latest dependencies so `opencode-ai` is installed, then redeploy/restart.
 
+**OpenCode/Gemini reports `Requests ending with a model turn are not supported`**
+→ This is an OpenCode regression affecting Gemini BYOK requests in OpenCode 1.18.21 and newer. This template uses OpenCode 1.18.20 until the upstream fix is released; redeploy so Railway installs that version.
+
+**An agent run fails**
+→ The wrapper retries failed agent runs indefinitely, every 60 seconds. This includes adapter and provider failures such as the OpenCode/Gemini error above. A retry creates a new run using the same agent and task, so correct permanent configuration problems before leaving the service running.
+
 **Gemini adapter fails with `Command not found in PATH: "gemini"`**
 → Ensure the service is running the latest image so `@google/gemini-cli` is installed, then redeploy/restart.
 

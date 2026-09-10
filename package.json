@@ -12,7 +12,7 @@
     "@anthropic-ai/claude-code": "latest",
     "@openai/codex": "latest",
     "@google/gemini-cli": "latest",
-    "opencode-ai": "latest"
+    "opencode-ai": "1.18.20"
   },
   "engines": {
     "node": ">=24.11.0"
