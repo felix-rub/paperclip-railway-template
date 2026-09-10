@@ -203,11 +203,20 @@ function seedCodexAuth() {
 //    Paperclip's acpx engine spawns the agent with an env allowlist that drops it.
 //    The user-scope settings file is the only lever that reaches both engines.
 function seedGeminiConfig() {
-  const key = process.env.GEMINI_API_KEY?.trim() || process.env.GOOGLE_API_KEY?.trim();
+  const geminiKey = process.env.GEMINI_API_KEY?.trim();
+  const googleKey = process.env.GOOGLE_API_KEY?.trim();
+  const key = geminiKey || googleKey;
   if (!key) return;
 
-  process.env.GEMINI_API_KEY = key;
-  process.env.GOOGLE_API_KEY = key;
+  if (!geminiKey) {
+    process.env.GEMINI_API_KEY = googleKey;
+  } else if (!googleKey) {
+    process.env.GOOGLE_API_KEY = geminiKey;
+  } else if (geminiKey !== googleKey) {
+    console.warn(
+      "   Warning: GEMINI_API_KEY and GOOGLE_API_KEY are both set with different values; preserving both and using GEMINI_API_KEY for Gemini settings."
+    );
+  }
 
   // Merge into any existing file rather than overwriting it — Gemini CLI persists
   // its own keys here and users may have added settings of their own.
