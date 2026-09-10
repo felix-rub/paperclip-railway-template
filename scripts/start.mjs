@@ -18,7 +18,7 @@
  */
 
 import { createServer, request as httpRequest } from "http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "fs";
 import { spawn, spawnSync } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -38,6 +38,11 @@ const APP_ROOT = join(__dirname, "..");
 // Codex home from here (it mirrors @paperclipai's resolveSharedCodexHomeDir).
 const SHARED_CODEX_HOME = process.env.CODEX_HOME?.trim() || join(homedir(), ".codex");
 const CODEX_AUTH_PATH = join(SHARED_CODEX_HOME, "auth.json");
+
+// Gemini CLI reads its user settings from $HOME/.gemini/settings.json. Both the
+// ACP engine (`gemini --acp`) and the CLI engine run as this same user locally.
+const GEMINI_HOME = join(homedir(), ".gemini");
+const GEMINI_SETTINGS_PATH = join(GEMINI_HOME, "settings.json");
 
 // Strip ANSI escape sequences (colors, cursor, etc.) from strings
 function stripAnsi(str) {
@@ -170,6 +175,77 @@ function seedCodexAuth() {
     unlinkSync(CODEX_AUTH_PATH);
     console.log(`   Removed stale Codex auth.json (OPENAI_API_KEY unset)`);
   }
+}
+
+// ── Gemini auth + trust seeding ───────────────────────────────────────────────
+//
+// Two separate Railway-specific breakages, both fixed here:
+//
+// 1. Key naming. Gemini's ACP mode (`gemini --acp`, used by Paperclip's default
+//    "acp" engine) picks the `gemini-api-key` auth type and then resolves the key
+//    from GEMINI_API_KEY only. GOOGLE_API_KEY is read exclusively on the
+//    `vertex-ai` path, so a Railway variable named GOOGLE_API_KEY fails
+//    `session/new` with "Gemini API key is missing or not configured.". Mirror the
+//    two names so either spelling works, before Paperclip is spawned — Paperclip's
+//    acpx engine projects both onto the agent child, but Gemini only reads one.
+//
+// 2. Settings file. Paperclip writes ~/.gemini/settings.json only for *remote*
+//    managed agent homes; on Railway the execution target is local, so nothing
+//    seeds it (Paperclip's own Docker image bakes the file — this image is built
+//    from node:slim and did not). Without it:
+//      • the auth type is never pinned, so a stray ACP `authenticate` call can
+//        persist `oauth-personal` and permanently shadow the API key;
+//      • folder trust stays enabled (its default), leaving every agent workspace
+//        untrusted — hence "Skipping project agents due to untrusted folder" and
+//        "Project hooks disabled because the folder is not trusted" in the logs,
+//        which also silently downgrades the approval mode away from yolo.
+//    The GEMINI_CLI_TRUST_WORKSPACE env var cannot fix this on the ACP lane:
+//    Paperclip's acpx engine spawns the agent with an env allowlist that drops it.
+//    The user-scope settings file is the only lever that reaches both engines.
+function seedGeminiConfig() {
+  const geminiKey = process.env.GEMINI_API_KEY?.trim();
+  const googleKey = process.env.GOOGLE_API_KEY?.trim();
+  const key = geminiKey || googleKey;
+
+  if (key) {
+    if (!geminiKey) {
+      process.env.GEMINI_API_KEY = googleKey;
+    } else if (!googleKey) {
+      process.env.GOOGLE_API_KEY = geminiKey;
+    } else if (geminiKey !== googleKey) {
+      console.warn(
+        "   Warning: GEMINI_API_KEY and GOOGLE_API_KEY are both set with different values; preserving both and using GEMINI_API_KEY for Gemini settings."
+      );
+    }
+  }
+
+  // Merge into any existing file rather than overwriting it — Gemini CLI persists
+  // its own keys here and users may have added settings of their own.
+  let settings = {};
+  if (existsSync(GEMINI_SETTINGS_PATH)) {
+    try {
+      const parsed = JSON.parse(readFileSync(GEMINI_SETTINGS_PATH, "utf8"));
+      if (parsed && typeof parsed === "object") settings = parsed;
+    } catch (_) {
+      console.warn(`   Ignoring unparsable ${GEMINI_SETTINGS_PATH}; rewriting it.`);
+    }
+  }
+
+  settings.security = {
+    ...settings.security,
+    ...(key ? { auth: { ...settings.security?.auth, selectedType: "gemini-api-key" } } : {}),
+    folderTrust: { ...settings.security?.folderTrust, enabled: false },
+  };
+  if (key) {
+    // Pre-1.0 Gemini CLI releases read the flat key instead of security.auth.
+    settings.selectedAuthType = "gemini-api-key";
+  }
+
+  mkdirSync(GEMINI_HOME, { recursive: true });
+  const tmpPath = `${GEMINI_SETTINGS_PATH}.tmp-${process.pid}`;
+  writeFileSync(tmpPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  renameSync(tmpPath, GEMINI_SETTINGS_PATH);
+  console.log(`   Seeded Gemini settings at ${GEMINI_SETTINGS_PATH}`);
 }
 
 // ── Paperclip process ─────────────────────────────────────────────────────────
@@ -366,7 +442,7 @@ function envVarStatus() {
     { key: "PAPERCLIP_HOME", required: false, label: "Paperclip Home", example: "/paperclip" },
     { key: "ANTHROPIC_API_KEY", required: false, label: "Anthropic API Key", example: "sk-ant-..." },
     { key: "OPENAI_API_KEY", required: false, label: "OpenAI API Key", example: "sk-..." },
-    { key: "GEMINI_API_KEY", required: false, label: "Gemini API Key", example: "AIza..." },
+    { key: "GEMINI_API_KEY", required: false, label: "Gemini API Key", example: "AIza... (GOOGLE_API_KEY also accepted)" },
   ];
   return all.map(v => ({
     ...v,
@@ -468,7 +544,16 @@ function startServer() {
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
+const shouldSeedGeminiConfig =
+  process.env.SEED_GEMINI_CONFIG === "1" ||
+  process.env.SEED_GEMINI_CONFIG === "true" ||
+  !!process.env.RAILWAY_PROJECT_ID ||
+  !!process.env.RAILWAY_SERVICE_ID;
+
 updatePaperclip();
+if (shouldSeedGeminiConfig) {
+  seedGeminiConfig();
+}
 startServer();
 
 if (isReady()) {
