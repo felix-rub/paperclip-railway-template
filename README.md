@@ -37,7 +37,6 @@ PAPERCLIP_ALLOWED_HOSTNAMES="your-app.up.railway.app"
 PAPERCLIP_DEPLOYMENT_MODE="authenticated"
 PAPERCLIP_DEPLOYMENT_EXPOSURE="public"
 PAPERCLIP_HOME="/paperclip"
-HOST="0.0.0.0"
 PORT="3100"
 NODE_ENV="production"
 
