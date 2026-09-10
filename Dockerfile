@@ -29,8 +29,10 @@ RUN chown -R paperclip:paperclip /app /home/paperclip
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Railway injects PORT at runtime (default 3100)
-ENV PORT=3100
+# Railway injects PORT at runtime (default 3100). Gemini ACP must not start
+# its own nested sandbox, which does not inherit the Railway API-key environment.
+ENV PORT=3100 \
+    GEMINI_SANDBOX=false
 EXPOSE 3100
 
 # Entrypoint runs as root to fix volume permissions, then drops to paperclip user
