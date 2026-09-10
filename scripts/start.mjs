@@ -539,8 +539,16 @@ function startServer() {
 
 // ── Entrypoint ────────────────────────────────────────────────────────────────
 
+const shouldSeedGeminiConfig =
+  process.env.SEED_GEMINI_CONFIG === "1" ||
+  process.env.SEED_GEMINI_CONFIG === "true" ||
+  !!process.env.RAILWAY_PROJECT_ID ||
+  !!process.env.RAILWAY_SERVICE_ID;
+
 updatePaperclip();
-seedGeminiConfig();
+if (shouldSeedGeminiConfig) {
+  seedGeminiConfig();
+}
 startServer();
 
 if (isReady()) {
