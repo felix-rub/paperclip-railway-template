@@ -4,9 +4,9 @@
 
 Railway doesn't provide shell access during deployment, so the normal `pnpm paperclipai onboard` flow can't run. This repo solves that by:
 
-1. On first boot, serving a **web-based setup page** at your Railway URL that checks all required env vars and walks you through configuration.
-2. Once you click **Launch Paperclip**, the setup page hands off to the real Paperclip server — which automatically runs DB migrations and starts up.
-3. You then visit your Railway URL and **sign up** — no CLI needed.
+1. On first boot, serving a **web-based setup page** at your Railway URL (`/setup`) that checks all required env vars and walks you through configuration.
+2. Once you click **Go to Manage**, the setup page starts Paperclip — which automatically runs DB migrations and starts up.
+3. You then use the generated invite link or the dashboard button to **register the first admin** — no CLI needed.
 
 ---
 
@@ -27,22 +27,31 @@ Railway doesn't provide shell access during deployment, so the normal `pnpm pape
 4. **Set these environment variables** on the Paperclip service:
 
 ```env
+# Required
 DATABASE_URL="${{Postgres.DATABASE_URL}}"
 BETTER_AUTH_SECRET="${{secret(32)}}"
 PAPERCLIP_PUBLIC_URL="https://your-app.up.railway.app"
 PAPERCLIP_ALLOWED_HOSTNAMES="your-app.up.railway.app"
+
+# Optional but recommended
 PAPERCLIP_DEPLOYMENT_MODE="authenticated"
+PAPERCLIP_DEPLOYMENT_EXPOSURE="public"
 PAPERCLIP_HOME="/paperclip"
-HOST="0.0.0.0"
 PORT="3100"
 NODE_ENV="production"
+
+# At least one agent API key is required for agent runs
+ANTHROPIC_API_KEY="sk-ant-..."
+OPENAI_API_KEY="sk-..."
+GEMINI_API_KEY="AIza..."
+# GOOGLE_API_KEY is also accepted for Gemini
 ```
 
 5. **Deploy** — Railway will run `npm start` which serves the setup page.
 
-6. **Open your Railway URL** — you'll see the setup page. Verify all vars are green, then click **Launch Paperclip**.
+6. **Open your Railway URL** — you'll see the setup page. Verify all required vars are green, then click **Go to Manage**.
 
-7. **Sign up** for an account on the Paperclip UI. The first user automatically gets board-level access.
+7. **Register the first admin** using the bootstrap invite link shown on the Manage tab. If an admin already exists, log in via the dashboard link instead.
 
 8. **Lock sign-ups**: go back to Railway Variables, add `PAPERCLIP_AUTH_DISABLE_SIGN_UP=true`, and redeploy.
 
@@ -53,15 +62,16 @@ NODE_ENV="production"
 ```
 npm start
   └── scripts/start.mjs
-        ├── if SETUP_COMPLETE != "true" AND no /paperclip/.setup_complete file:
-        │     serve setup UI on PORT  (/setup)
-        │     user clicks "Launch" → writes flag → restarts as paperclip
-        └── else:
-              write minimal config.json to PAPERCLIP_HOME
-              spawn: paperclipai run --yes --no-onboard
+        ├── always serve setup UI on PORT (3100) at /setup
+        ├── when "Go to Manage" is clicked and env vars are ready:
+        │     write minimal config.json to PAPERCLIP_HOME
+        │     spawn: paperclipai run
+        │     proxy :3100 → internal Paperclip on :3099
+        └── env var readiness is derived from reality (config.json + required env vars);
+            there is no SETUP_COMPLETE env var or .setup_complete flag file
 ```
 
-The setup page auto-polls Railway's env vars by hitting `/setup/status` — each var shows as ✓ Set or ✗ Missing in real time.
+The setup page auto-polls env vars by hitting `/setup/status` — each var shows as ✓ Set or ✗ Missing in real time.
 
 ---
 
@@ -69,9 +79,12 @@ The setup page auto-polls Railway's env vars by hitting `/setup/status` — each
 
 ```
 paperclip-railway/
+├── Dockerfile            # Node 24.11 image with gosu, ca-certificates, and agent CLIs
+├── entrypoint.sh         # fixes /paperclip volume ownership, then drops to non-root user
 ├── package.json          # installs paperclipai + local agent CLIs, defines start script
 ├── scripts/
-│   └── start.mjs         # setup server + paperclip launcher
+│   ├── setup.html        # web-based setup / management UI
+│   └── start.mjs         # setup server + config writer + paperclip launcher/proxy
 └── README.md
 ```
 
@@ -79,7 +92,7 @@ paperclip-railway/
 
 ## After first launch
 
-Once Paperclip is running, this wrapper is transparent — it just passes through to `paperclipai run`. The `/setup` page is bypassed on all subsequent restarts (the flag file persists in the `/paperclip` volume).
+Once Paperclip is running, this wrapper is transparent — it proxies public traffic on `PORT` to Paperclip's internal port (`3099`) while continuing to serve `/setup/*` for management. On subsequent container restarts, Paperclip starts automatically as soon as `config.json` exists and the required env vars are set.
 
 ---
 
@@ -94,8 +107,8 @@ Once Paperclip is running, this wrapper is transparent — it just passes throug
 **`DATABASE_URL` SSL errors**
 → Add `DATABASE_SSL_REJECT_UNAUTHORIZED=false` to your Railway env vars.
 
-**Paperclip starts but agents can't connect**
-→ Make sure `PAPERCLIP_DEPLOYMENT_EXPOSURE=public` is set so the server accepts external connections.
+**Paperclip starts but agents can't connect or the dashboard shows a private-deployment error**
+→ Make sure `PAPERCLIP_DEPLOYMENT_EXPOSURE=public` is set so the server accepts external connections. This is the default used by `start.mjs`, but set it explicitly in Railway variables to be safe.
 
 **Agent runs fail with `401 Unauthorized: Missing bearer` (Codex / OpenAI)**
 → The Codex CLI (≥ 0.122) ignores the `OPENAI_API_KEY` env var and only reads credentials from `$CODEX_HOME/auth.json`. On boot, this wrapper seeds `~/.codex/auth.json` from `OPENAI_API_KEY` so Paperclip propagates it to each agent's Codex home. If you set the key after the first deploy, redeploy (or restart) so the file is written, then retry the task.
@@ -120,7 +133,9 @@ Once Paperclip is running, this wrapper is transparent — it just passes throug
 
 ## Paperclip updates
 
-Paperclip is intentionally declared as `latest` and refreshed on every container start. Do not pin its version: new upstream releases are applied automatically on Railway restarts and redeploys.
+Paperclip is intentionally declared as `latest` in `package.json` and refreshed on every container start by `scripts/start.mjs`. Do not pin its version: new upstream releases are applied automatically on Railway restarts and redeploys.
+
+This repo requires **Node.js >=24.11.0** (see `package.json` and `Dockerfile`). If upstream Paperclip bumps its Node requirement, update both files accordingly.
 
 ## Keeping this fork up to date
 
