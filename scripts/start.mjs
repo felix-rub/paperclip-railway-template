@@ -206,16 +206,17 @@ function seedGeminiConfig() {
   const geminiKey = process.env.GEMINI_API_KEY?.trim();
   const googleKey = process.env.GOOGLE_API_KEY?.trim();
   const key = geminiKey || googleKey;
-  if (!key) return;
 
-  if (!geminiKey) {
-    process.env.GEMINI_API_KEY = googleKey;
-  } else if (!googleKey) {
-    process.env.GOOGLE_API_KEY = geminiKey;
-  } else if (geminiKey !== googleKey) {
-    console.warn(
-      "   Warning: GEMINI_API_KEY and GOOGLE_API_KEY are both set with different values; preserving both and using GEMINI_API_KEY for Gemini settings."
-    );
+  if (key) {
+    if (!geminiKey) {
+      process.env.GEMINI_API_KEY = googleKey;
+    } else if (!googleKey) {
+      process.env.GOOGLE_API_KEY = geminiKey;
+    } else if (geminiKey !== googleKey) {
+      console.warn(
+        "   Warning: GEMINI_API_KEY and GOOGLE_API_KEY are both set with different values; preserving both and using GEMINI_API_KEY for Gemini settings."
+      );
+    }
   }
 
   // Merge into any existing file rather than overwriting it — Gemini CLI persists
@@ -232,11 +233,13 @@ function seedGeminiConfig() {
 
   settings.security = {
     ...settings.security,
-    auth: { ...settings.security?.auth, selectedType: "gemini-api-key" },
+    ...(key ? { auth: { ...settings.security?.auth, selectedType: "gemini-api-key" } } : {}),
     folderTrust: { ...settings.security?.folderTrust, enabled: false },
   };
-  // Pre-1.0 Gemini CLI releases read the flat key instead of security.auth.
-  settings.selectedAuthType = "gemini-api-key";
+  if (key) {
+    // Pre-1.0 Gemini CLI releases read the flat key instead of security.auth.
+    settings.selectedAuthType = "gemini-api-key";
+  }
 
   mkdirSync(GEMINI_HOME, { recursive: true });
   const tmpPath = `${GEMINI_SETTINGS_PATH}.tmp-${process.pid}`;
