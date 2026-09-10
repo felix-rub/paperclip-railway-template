@@ -29,8 +29,10 @@ RUN chown -R paperclip:paperclip /app /home/paperclip
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
-# Railway injects PORT at runtime (default 3100). Gemini ACP must not start
-# its own nested sandbox, which does not inherit the Railway API-key environment.
+# Railway injects PORT at runtime (default 3100). GEMINI_SANDBOX=false stops the
+# Gemini CLI engine from launching its own Docker-in-Docker sandbox inside this
+# container. (The ACP engine is unaffected: Paperclip spawns it with an env
+# allowlist that does not include GEMINI_SANDBOX.)
 ENV PORT=3100 \
     GEMINI_SANDBOX=false
 EXPOSE 3100

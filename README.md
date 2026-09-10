@@ -103,8 +103,17 @@ Once Paperclip is running, this wrapper is transparent — it just passes throug
 **OpenCode adapter probe fails with `opencode: command not found`**
 → Ensure the service was deployed with the latest dependencies so `opencode-ai` is installed, then redeploy/restart.
 
-**Gemini adapter fails with `Command not found in PATH: "gemini"` or `Gemini API key is missing or not configured`**
-→ Ensure the service is running the latest image so `@google/gemini-cli` is installed, set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Railway variables, then redeploy/restart. The image disables Gemini's nested sandbox so ACP runs inherit this key.
+**Gemini adapter fails with `Command not found in PATH: "gemini"`**
+→ Ensure the service is running the latest image so `@google/gemini-cli` is installed, then redeploy/restart.
+
+**Gemini adapter fails with `Gemini API key is missing or not configured` (ACP engine)**
+→ Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Railway variables and redeploy/restart. On boot this wrapper mirrors the two variable names onto each other and writes `~/.gemini/settings.json` pinning `security.auth.selectedType` to `gemini-api-key`. Both steps are required: Gemini's ACP mode resolves the key from `GEMINI_API_KEY` only — `GOOGLE_API_KEY` is read exclusively on the Vertex AI auth path — and a previously persisted `oauth-personal` auth type would otherwise shadow the key permanently. Paperclip itself only seeds this file for *remote* agent homes, so on Railway (a local execution target) nothing wrote it before.
+
+**Gemini logs show `Skipping project agents due to untrusted folder` / `Project hooks disabled because the folder is not trusted`**
+→ Fixed by the same `~/.gemini/settings.json` seeding, which disables Gemini's folder-trust gate (`security.folderTrust.enabled: false`). Left at its default, that gate also silently downgrades the agent's approval mode away from yolo. The `GEMINI_CLI_TRUST_WORKSPACE` environment variable does *not* help here — Paperclip spawns the ACP agent with an env allowlist that drops it.
+
+**Gemini adapter fails with `Error: spawn E2BIG` (Gemini CLI engine)**
+→ Switch the agent's `gemini_local` adapter back to the **ACP engine** (`engine: "acp"`, the default). This is an upstream Paperclip limitation rather than a Railway one: the CLI engine passes the whole composed prompt as a single `--prompt <...>` command-line argument, and Linux rejects any single argument larger than 128 KiB with `E2BIG`. Long instructions plus a session handoff cross that limit. The ACP engine sends the prompt over the ACP JSON-RPC stdio channel instead, so it has no such ceiling. If you must stay on the CLI engine, shrink the agent's `instructionsFilePath` / `promptTemplate`.
 
 **Dashboard reports Minified React error #185**
 → Restart or redeploy the service, then reload after it is healthy. The wrapper checks for and installs the newest Paperclip release on every startup, so it automatically receives upstream UI fixes.
