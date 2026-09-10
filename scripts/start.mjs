@@ -351,6 +351,7 @@ function envVarStatus() {
     { key: "PAPERCLIP_HOME", required: false, label: "Paperclip Home", example: "/paperclip" },
     { key: "ANTHROPIC_API_KEY", required: false, label: "Anthropic API Key", example: "sk-ant-..." },
     { key: "OPENAI_API_KEY", required: false, label: "OpenAI API Key", example: "sk-..." },
+    { key: "GEMINI_API_KEY", required: false, label: "Gemini API Key", example: "AIza..." },
   ];
   return all.map(v => ({
     ...v,

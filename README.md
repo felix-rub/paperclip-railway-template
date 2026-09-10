@@ -102,3 +102,6 @@ Once Paperclip is running, this wrapper is transparent — it just passes throug
 
 **OpenCode adapter probe fails with `opencode: command not found`**
 → Ensure the service was deployed with the latest dependencies so `opencode-ai` is installed, then redeploy/restart.
+
+**Gemini adapter fails with `Command not found in PATH: "gemini"`**
+→ Ensure the service is running the latest image so `@google/gemini-cli` is installed, set `GEMINI_API_KEY` in Railway variables, then redeploy/restart.
