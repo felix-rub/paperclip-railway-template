@@ -43,6 +43,16 @@ const CODEX_AUTH_PATH = join(SHARED_CODEX_HOME, "auth.json");
 // ACP engine (`gemini --acp`) and the CLI engine run as this same user locally.
 const GEMINI_HOME = join(homedir(), ".gemini");
 const GEMINI_SETTINGS_PATH = join(GEMINI_HOME, "settings.json");
+const PAPERCLIP_RECOVERY_SERVICE_PATH = join(
+  APP_ROOT,
+  "node_modules",
+  "@paperclipai",
+  "server",
+  "dist",
+  "services",
+  "recovery",
+  "service.js",
+);
 
 // Strip ANSI escape sequences (colors, cursor, etc.) from strings
 function stripAnsi(str) {
@@ -86,6 +96,55 @@ function updatePaperclip() {
   if (result.error || result.status !== 0) {
     console.warn(`⚠️ Could not refresh Paperclip; using the installed release.${result.error ? ` ${result.error.message}` : ""}`);
   }
+}
+
+// Paperclip's recovery policy is not configurable. Keep the runtime at latest,
+// but make every failed agent execution eligible for another recovery attempt
+// on the next 60-second scheduler tick.
+function enforceAgentRetryPolicy() {
+  let source = readFileSync(PAPERCLIP_RECOVERY_SERVICE_PATH, "utf8");
+  const replacements = [
+    [
+      "if (latestRun.errorCode === \"configuration_incomplete\" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {\n        return { kind: \"configuration_incomplete\" };\n    }",
+      "if (latestRun.errorCode === \"configuration_incomplete\" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {\n        return null;\n    }",
+    ],
+    [
+      "return { kind: \"non_retryable\", maxAttempts: 0, baseBackoffMs: 0, errorCode };",
+      "return { kind: \"default\", maxAttempts: Number.MAX_SAFE_INTEGER, baseBackoffMs: 60_000, errorCode };",
+    ],
+    [
+      "maxAttempts: CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS,",
+      "maxAttempts: Number.MAX_SAFE_INTEGER,",
+    ],
+    [
+      "maxAttempts: CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS,\n        baseBackoffMs: 0,",
+      "maxAttempts: Number.MAX_SAFE_INTEGER,\n        baseBackoffMs: 60_000,",
+    ],
+    [
+      "const requiredDelay = classification.baseBackoffMs *\n                            Math.pow(2, Math.max(0, consecutive - 1));",
+      "const requiredDelay = classification.baseBackoffMs;",
+    ],
+    [
+      "const retryAt = readProviderQuotaRetryAt(input.latestRun, now);",
+      "const retryAt = new Date(now.getTime() + 60_000);",
+    ],
+  ];
+
+  for (const [before, after] of replacements) {
+    const occurrences = source.split(before).length - 1;
+    if (occurrences === 1) {
+      source = source.replace(before, after);
+      continue;
+    }
+    if (occurrences !== 0 || !source.includes(after)) {
+      throw new Error(`Could not apply the Paperclip retry-policy patch: expected one match for ${JSON.stringify(before)}.`);
+    }
+  }
+
+  const tmpPath = `${PAPERCLIP_RECOVERY_SERVICE_PATH}.tmp-${process.pid}`;
+  writeFileSync(tmpPath, source, { mode: 0o644 });
+  renameSync(tmpPath, PAPERCLIP_RECOVERY_SERVICE_PATH);
+  console.log("   Enforced unlimited 60-second retries for failed agent runs.");
 }
 
 // ── Config builder ────────────────────────────────────────────────────────────
@@ -270,6 +329,7 @@ function startPaperclip() {
         PORT: String(PAPERCLIP_PORT),
         HOST: "127.0.0.1",
         NODE_ENV: process.env.NODE_ENV || "production",
+        HEARTBEAT_SCHEDULER_INTERVAL_MS: "60000",
       },
     }
   );
@@ -551,6 +611,7 @@ const shouldSeedGeminiConfig =
   !!process.env.RAILWAY_SERVICE_ID;
 
 updatePaperclip();
+enforceAgentRetryPolicy();
 if (shouldSeedGeminiConfig) {
   seedGeminiConfig();
 }
