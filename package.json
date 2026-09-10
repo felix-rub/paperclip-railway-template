@@ -11,6 +11,7 @@
     "paperclipai": "2026.831.1",
     "@anthropic-ai/claude-code": "latest",
     "@openai/codex": "latest",
+    "@google/gemini-cli": "latest",
     "opencode-ai": "latest"
   },
   "engines": {
