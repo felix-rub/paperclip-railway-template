@@ -18,7 +18,7 @@
  */
 
 import { createServer, request as httpRequest } from "http";
-import { readFileSync, writeFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
+import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "fs";
 import { spawn, spawnSync } from "child_process";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
@@ -239,7 +239,9 @@ function seedGeminiConfig() {
   settings.selectedAuthType = "gemini-api-key";
 
   mkdirSync(GEMINI_HOME, { recursive: true });
-  writeFileSync(GEMINI_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  const tmpPath = `${GEMINI_SETTINGS_PATH}.tmp-${process.pid}`;
+  writeFileSync(tmpPath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  renameSync(tmpPath, GEMINI_SETTINGS_PATH);
   console.log(`   Seeded Gemini settings at ${GEMINI_SETTINGS_PATH}`);
 }
 
