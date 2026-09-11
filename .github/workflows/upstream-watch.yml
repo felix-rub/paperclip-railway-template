@@ -129,8 +129,9 @@ jobs:
       # the COPILOT_PAT repository secret to enable this step. Without it,
       # the issue above is still created for a human to assign manually.
       - name: Assign Copilot coding agent
-        if: steps.diff.outputs.changed == 'true' && secrets.COPILOT_PAT != ''
+        if: steps.diff.outputs.changed == 'true' && env.COPILOT_PAT != ''
         env:
+          COPILOT_PAT: ${{ secrets.COPILOT_PAT }}
           GH_TOKEN: ${{ secrets.COPILOT_PAT }}
         run: |
           gh api \
