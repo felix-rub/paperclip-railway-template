@@ -164,29 +164,43 @@ function enforceAgentRetryPolicy() {
 function enforceGeminiAcpModelCompatibility() {
   let source = readFileSync(PAPERCLIP_ACPX_EXECUTOR_PATH, "utf8");
   let changed = false;
-  const replacements = [
-    [
-      `    if (acpxAgent === "gemini" && agentCommandShell) {
+  const geminiModelBefore = `    if (acpxAgent === "gemini" && agentCommandShell) {
         const normalized = await normalizeGeminiAcpCommandShell(agentCommandShell, ensurePathInEnv({ ...process.env, ...env }));
         if (normalized !== agentCommandShell) {
             agentCommandShell = normalized;
             agentCommand = normalized;
         }
-    }`,
-      `    if (acpxAgent === "gemini" && agentCommandShell) {
+    }`;
+  const geminiModelAfter = `    if (acpxAgent === "gemini" && agentCommandShell) {
         const normalized = await normalizeGeminiAcpCommandShell(agentCommandShell, ensurePathInEnv({ ...process.env, ...env }));
         if (normalized !== agentCommandShell) {
             agentCommandShell = normalized;
             agentCommand = normalized;
         }
-        if (requestedModel && !agentCommandShell.split(/\\s+/).includes("--model")) {
+        if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m\\s)/.test(agentCommandShell)) {
             agentCommandShell = \`\${agentCommandShell} --model \${shellQuote(requestedModel)}\`;
             agentCommand = agentCommand ? \`\${agentCommand} --model \${requestedModel}\` : agentCommand;
         }
-    }`,
-    ],
-    [
-      `function sessionConfigOptions(prepared) {
+    }`;
+  const geminiModelStableMarker =
+    /if \(requestedModel && !\/\(\?:\^\|\\s\)\(\?:--model\(\?:\\s\|=\)\|-m\\s\)\/\.test\(agentCommandShell\)\) \{[\s\S]*agentCommandShell = `\$\{agentCommandShell\} --model \$\{shellQuote\(requestedModel\)\}`;/.test(source);
+
+  const geminiModelOccurrences = source.split(geminiModelBefore).length - 1;
+  if (geminiModelOccurrences === 1) {
+    source = source.replace(geminiModelBefore, geminiModelAfter);
+    changed = true;
+  } else if (geminiModelOccurrences !== 0 || !geminiModelStableMarker) {
+    throw new Error("Could not apply the Paperclip Gemini ACP model-startup patch.");
+  }
+
+  const legacyModelFlagGuard = `if (requestedModel && !agentCommandShell.split(/\\s+/).includes("--model")) {`;
+  const modelFlagGuard = `if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m\\s)/.test(agentCommandShell)) {`;
+  if (source.includes(legacyModelFlagGuard)) {
+    source = source.replace(legacyModelFlagGuard, modelFlagGuard);
+    changed = true;
+  }
+
+  const sessionConfigBefore = `function sessionConfigOptions(prepared) {
     const options = [];
     // Claude and Codex runtime config is pre-set via startup env vars; skip
     // set_config_option to avoid ACP-server picker validation rejecting valid
@@ -206,8 +220,8 @@ function enforceGeminiAcpModelCompatibility() {
         options.push({ key: "service_tier", value: "fast" }, { key: "features.fast_mode", value: "true" });
     }
     return options;
-}`,
-      `function sessionConfigOptions(prepared) {
+}`;
+  const sessionConfigAfter = `function sessionConfigOptions(prepared) {
     const options = [];
     // Claude and Codex runtime config is pre-set via startup env vars; skip
     // set_config_option to avoid ACP-server picker validation rejecting valid
@@ -234,20 +248,17 @@ function enforceGeminiAcpModelCompatibility() {
         options.push({ key: "service_tier", value: "fast" }, { key: "features.fast_mode", value: "true" });
     }
     return options;
-}`,
-    ],
-  ];
+}`;
+  const sessionConfigStableMarker =
+    /prepared\.acpxAgent !== "gemini"/.test(source) ||
+    /if \(prepared\.acpxAgent === "gemini"\)\s*\{\s*return options;\s*\}/.test(source);
 
-  for (const [before, after] of replacements) {
-    const occurrences = source.split(before).length - 1;
-    if (occurrences === 1) {
-      source = source.replace(before, after);
-      changed = true;
-      continue;
-    }
-    if (occurrences !== 0 || !source.includes(after)) {
-      throw new Error(`Could not apply the Paperclip Gemini ACP patch: expected one match for ${JSON.stringify(before)}.`);
-    }
+  const sessionConfigOccurrences = source.split(sessionConfigBefore).length - 1;
+  if (sessionConfigOccurrences === 1) {
+    source = source.replace(sessionConfigBefore, sessionConfigAfter);
+    changed = true;
+  } else if (sessionConfigOccurrences !== 0 || !sessionConfigStableMarker) {
+    throw new Error("Could not apply the Paperclip Gemini ACP session-config patch.");
   }
 
   if (changed) {
