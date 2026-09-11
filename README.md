@@ -128,6 +128,9 @@ Once Paperclip is running, this wrapper is transparent — it proxies public tra
 **Gemini adapter fails with `Gemini API key is missing or not configured` (ACP engine)**
 → Set `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) in Railway variables and redeploy/restart. On boot this wrapper mirrors the two variable names onto each other and writes `~/.gemini/settings.json` pinning `security.auth.selectedType` to `gemini-api-key`. Both steps are required: Gemini's ACP mode resolves the key from `GEMINI_API_KEY` only — `GOOGLE_API_KEY` is read exclusively on the Vertex AI auth path — and a previously persisted `oauth-personal` auth type would otherwise shadow the key permanently. Paperclip itself only seeds this file for *remote* agent homes, so on Railway (a local execution target) nothing wrote it before.
 
+**Gemini adapter fails with `Method not found: session/set_config_option` (ACP -32601)**
+→ Redeploy with the latest template. Gemini CLI's ACP server does not implement that configuration method, but Paperclip currently uses it when an adapter model is selected. On boot this wrapper applies the pending [upstream fix](https://github.com/paperclipai/paperclip/pull/11231): it passes the model through Gemini's startup `--model` option and skips unsupported dynamic ACP configuration calls.
+
 **Gemini logs show `Skipping project agents due to untrusted folder` / `Project hooks disabled because the folder is not trusted`**
 → Fixed by the same `~/.gemini/settings.json` seeding, which disables Gemini's folder-trust gate (`security.folderTrust.enabled: false`). Left at its default, that gate also silently downgrades the agent's approval mode away from yolo. The `GEMINI_CLI_TRUST_WORKSPACE` environment variable does *not* help here — Paperclip spawns the ACP agent with an env allowlist that drops it.
 
