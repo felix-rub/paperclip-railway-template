@@ -53,6 +53,15 @@ const PAPERCLIP_RECOVERY_SERVICE_PATH = join(
   "recovery",
   "service.js",
 );
+const PAPERCLIP_ACPX_EXECUTOR_PATH = join(
+  APP_ROOT,
+  "node_modules",
+  "@paperclipai",
+  "adapter-utils",
+  "dist",
+  "acpx-engine",
+  "execute.js",
+);
 
 // Strip ANSI escape sequences (colors, cursor, etc.) from strings
 function stripAnsi(str) {
@@ -145,6 +154,108 @@ function enforceAgentRetryPolicy() {
   writeFileSync(tmpPath, source, { mode: 0o644 });
   renameSync(tmpPath, PAPERCLIP_RECOVERY_SERVICE_PATH);
   console.log("   Enforced unlimited 60-second retries for failed agent runs.");
+}
+
+// Paperclip's Gemini ACP lane currently tries to select the model through
+// session/set_config_option. Gemini CLI only implements the legacy
+// session/set_model method, so that request fails with ACP -32601 before the
+// first prompt. Apply the pending upstream fix: select Gemini's model with its
+// startup --model flag and skip all unsupported dynamic config requests.
+function enforceGeminiAcpModelCompatibility() {
+  let source = readFileSync(PAPERCLIP_ACPX_EXECUTOR_PATH, "utf8");
+  let changed = false;
+  const replacements = [
+    [
+      `    if (acpxAgent === "gemini" && agentCommandShell) {
+        const normalized = await normalizeGeminiAcpCommandShell(agentCommandShell, ensurePathInEnv({ ...process.env, ...env }));
+        if (normalized !== agentCommandShell) {
+            agentCommandShell = normalized;
+            agentCommand = normalized;
+        }
+    }`,
+      `    if (acpxAgent === "gemini" && agentCommandShell) {
+        const normalized = await normalizeGeminiAcpCommandShell(agentCommandShell, ensurePathInEnv({ ...process.env, ...env }));
+        if (normalized !== agentCommandShell) {
+            agentCommandShell = normalized;
+            agentCommand = normalized;
+        }
+        if (requestedModel && !agentCommandShell.split(/\\s+/).includes("--model")) {
+            agentCommandShell = \`\${agentCommandShell} --model \${shellQuote(requestedModel)}\`;
+            agentCommand = agentCommand ? \`\${agentCommand} --model \${requestedModel}\` : agentCommand;
+        }
+    }`,
+    ],
+    [
+      `function sessionConfigOptions(prepared) {
+    const options = [];
+    // Claude and Codex runtime config is pre-set via startup env vars; skip
+    // set_config_option to avoid ACP-server picker validation rejecting valid
+    // backend model IDs that are not advertised by the local ACP server.
+    if (prepared.requestedModel &&
+        prepared.acpxAgent !== "claude" &&
+        prepared.acpxAgent !== "codex") {
+        options.push({ key: "model", value: prepared.requestedModel });
+    }
+    if (prepared.requestedThinkingEffort && prepared.acpxAgent !== "codex") {
+        options.push({
+            key: "effort",
+            value: prepared.requestedThinkingEffort,
+        });
+    }
+    if (prepared.fastMode && prepared.acpxAgent !== "codex") {
+        options.push({ key: "service_tier", value: "fast" }, { key: "features.fast_mode", value: "true" });
+    }
+    return options;
+}`,
+      `function sessionConfigOptions(prepared) {
+    const options = [];
+    // Claude and Codex runtime config is pre-set via startup env vars; skip
+    // set_config_option to avoid ACP-server picker validation rejecting valid
+    // backend model IDs that are not advertised by the local ACP server.
+    // Gemini's ACP server does not implement session/set_config_option at all;
+    // its model is passed as a startup flag above, while other options are unsupported.
+    if (prepared.requestedModel &&
+        prepared.acpxAgent !== "claude" &&
+        prepared.acpxAgent !== "codex" &&
+        prepared.acpxAgent !== "gemini") {
+        options.push({ key: "model", value: prepared.requestedModel });
+    }
+    if (prepared.requestedThinkingEffort &&
+        prepared.acpxAgent !== "codex" &&
+        prepared.acpxAgent !== "gemini") {
+        options.push({
+            key: "effort",
+            value: prepared.requestedThinkingEffort,
+        });
+    }
+    if (prepared.fastMode &&
+        prepared.acpxAgent !== "codex" &&
+        prepared.acpxAgent !== "gemini") {
+        options.push({ key: "service_tier", value: "fast" }, { key: "features.fast_mode", value: "true" });
+    }
+    return options;
+}`,
+    ],
+  ];
+
+  for (const [before, after] of replacements) {
+    const occurrences = source.split(before).length - 1;
+    if (occurrences === 1) {
+      source = source.replace(before, after);
+      changed = true;
+      continue;
+    }
+    if (occurrences !== 0 || !source.includes(after)) {
+      throw new Error(`Could not apply the Paperclip Gemini ACP patch: expected one match for ${JSON.stringify(before)}.`);
+    }
+  }
+
+  if (changed) {
+    const tmpPath = `${PAPERCLIP_ACPX_EXECUTOR_PATH}.tmp-${process.pid}`;
+    writeFileSync(tmpPath, source, { mode: 0o644 });
+    renameSync(tmpPath, PAPERCLIP_ACPX_EXECUTOR_PATH);
+  }
+  console.log("   Enforced Gemini ACP model compatibility.");
 }
 
 // ── Config builder ────────────────────────────────────────────────────────────
@@ -612,6 +723,7 @@ const shouldSeedGeminiConfig =
 
 updatePaperclip();
 enforceAgentRetryPolicy();
+enforceGeminiAcpModelCompatibility();
 if (shouldSeedGeminiConfig) {
   seedGeminiConfig();
 }
