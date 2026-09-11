@@ -1,7 +1,7 @@
-FROM node:24.11.0-slim
+FROM node:24-slim
 
 # Install gosu (privilege dropping in entrypoint) and ca-certificates.
-# ca-certificates is required: node:24.11.0-slim ships without the system CA bundle, and the
+# ca-certificates is required: node:24-slim ships without the system CA bundle, and the
 # agent CLIs (codex/claude) use the OS trust store for TLS to api.openai.com / api.anthropic.com.
 # Without it, agent runs fail with "no native root CA certificates found". (Node's own fetch is
 # unaffected because Node bundles its own CAs.)
