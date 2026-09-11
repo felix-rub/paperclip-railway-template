@@ -177,13 +177,15 @@ function enforceGeminiAcpModelCompatibility() {
             agentCommandShell = normalized;
             agentCommand = normalized;
         }
-        if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m\\s)/.test(agentCommandShell)) {
+        if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m(?:\\s|=))/.test(agentCommandShell)) {
             agentCommandShell = \`\${agentCommandShell} --model \${shellQuote(requestedModel)}\`;
             agentCommand = agentCommand ? \`\${agentCommand} --model \${requestedModel}\` : agentCommand;
         }
     }`;
   const geminiModelStableMarker =
-    /if \(requestedModel && !\/\(\?:\^\|\\s\)\(\?:--model\(\?:\\s\|=\)\|-m\\s\)\/\.test\(agentCommandShell\)\) \{[\s\S]*agentCommandShell = `\$\{agentCommandShell\} --model \$\{shellQuote\(requestedModel\)\}`;/.test(source);
+    /acpxAgent\s*===\s*"gemini"\s*&&\s*agentCommandShell/.test(source) &&
+    /agentCommandShell\s*=\s*`\$\{agentCommandShell\}\s+--model\s+\$\{shellQuote\(requestedModel\)\}`;/.test(source) &&
+    (/--model\(\?:\\\\s\|=\)\|-m\(\?:\\\\s\|=\)/.test(source) || /--model(?:\s|=)|-m(?:\s|=)/.test(source));
 
   const geminiModelOccurrences = source.split(geminiModelBefore).length - 1;
   if (geminiModelOccurrences === 1) {
@@ -194,7 +196,7 @@ function enforceGeminiAcpModelCompatibility() {
   }
 
   const legacyModelFlagGuard = `if (requestedModel && !agentCommandShell.split(/\\s+/).includes("--model")) {`;
-  const modelFlagGuard = `if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m\\s)/.test(agentCommandShell)) {`;
+  const modelFlagGuard = `if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m(?:\\s|=))/.test(agentCommandShell)) {`;
   if (source.includes(legacyModelFlagGuard)) {
     source = source.replace(legacyModelFlagGuard, modelFlagGuard);
     changed = true;
