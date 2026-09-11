@@ -182,6 +182,13 @@ function enforceGeminiAcpModelCompatibility() {
             agentCommand = agentCommand ? \`\${agentCommand} --model \${requestedModel}\` : agentCommand;
         }
     }`;
+  const legacyModelFlagGuard = `if (requestedModel && !agentCommandShell.split(/\\s+/).includes("--model")) {`;
+  const modelFlagGuard = `if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m(?:\\s|=))/.test(agentCommandShell)) {`;
+  if (source.includes(legacyModelFlagGuard)) {
+    source = source.replace(legacyModelFlagGuard, modelFlagGuard);
+    changed = true;
+  }
+
   const geminiModelStableMarker =
     /acpxAgent\s*===\s*"gemini"\s*&&\s*agentCommandShell/.test(source) &&
     /agentCommandShell\s*=\s*`\$\{agentCommandShell\}\s+--model\s+\$\{shellQuote\(requestedModel\)\}`;/.test(source) &&
@@ -193,13 +200,6 @@ function enforceGeminiAcpModelCompatibility() {
     changed = true;
   } else if (geminiModelOccurrences !== 0 || !geminiModelStableMarker) {
     throw new Error("Could not apply the Paperclip Gemini ACP model-startup patch.");
-  }
-
-  const legacyModelFlagGuard = `if (requestedModel && !agentCommandShell.split(/\\s+/).includes("--model")) {`;
-  const modelFlagGuard = `if (requestedModel && !/(?:^|\\s)(?:--model(?:\\s|=)|-m(?:\\s|=))/.test(agentCommandShell)) {`;
-  if (source.includes(legacyModelFlagGuard)) {
-    source = source.replace(legacyModelFlagGuard, modelFlagGuard);
-    changed = true;
   }
 
   const sessionConfigBefore = `function sessionConfigOptions(prepared) {
