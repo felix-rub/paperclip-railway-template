@@ -79,7 +79,7 @@ The setup page auto-polls env vars by hitting `/setup/status` — each var shows
 
 ```
 paperclip-railway/
-├── Dockerfile            # Node 24.11 image with gosu, ca-certificates, and agent CLIs
+├── Dockerfile            # Node 24 image with gosu, ca-certificates, and agent CLIs
 ├── entrypoint.sh         # fixes /paperclip volume ownership, then drops to non-root user
 ├── package.json          # installs paperclipai + local agent CLIs, defines start script
 ├── scripts/
@@ -141,7 +141,7 @@ Once Paperclip is running, this wrapper is transparent — it proxies public tra
 
 Paperclip is intentionally declared as `latest` in `package.json` and refreshed on every container start by `scripts/start.mjs`. Do not pin its version: new upstream releases are applied automatically on Railway restarts and redeploys.
 
-This repo requires **Node.js >=24.11.0** (see `package.json` and `Dockerfile`). If upstream Paperclip bumps its Node requirement, update both files accordingly.
+This repo requires **Node.js 24 or higher** (see `package.json` and `Dockerfile`). If upstream Paperclip bumps its Node requirement, update both files accordingly.
 
 ## Keeping this fork up to date
 
