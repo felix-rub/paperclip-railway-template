@@ -144,7 +144,7 @@ Once Paperclip is running, this wrapper is transparent — it proxies public tra
 
 Paperclip is intentionally declared as `latest` in `package.json` and refreshed on every container start by `scripts/start.mjs`. Do not pin its version: new upstream releases are applied automatically on Railway restarts and redeploys.
 
-This repo requires **Node.js 24 or higher** (see `package.json` and `Dockerfile`). If upstream Paperclip bumps its Node requirement, update both files accordingly.
+This repo requires **Node.js 24.11.0 or higher** (see `package.json` and `Dockerfile`). If upstream Paperclip bumps its Node requirement, update both files accordingly.
 
 ## Keeping this fork up to date
 
