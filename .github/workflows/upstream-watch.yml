@@ -116,10 +116,11 @@ jobs:
         id: create_issue
         env:
           GH_TOKEN: ${{ github.token }}
+          ISSUE_BODY: ${{ steps.body.outputs.body }}
         run: |
           issue_url=$(gh issue create \
             --title "Upstream update available: keep Railway deployment current" \
-            --body "${{ steps.body.outputs.body }}")
+            --body "$ISSUE_BODY")
           echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
           echo "issue_number=$(basename "$issue_url")" >> "$GITHUB_OUTPUT"
 
@@ -154,6 +155,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add "$STATE_FILE"
+          git add -f "$STATE_FILE"
           git diff --cached --quiet || git commit -m "chore: record latest paperclip/upstream versions [skip ci]"
           git push
