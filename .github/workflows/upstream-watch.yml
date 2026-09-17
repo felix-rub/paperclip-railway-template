@@ -116,10 +116,11 @@ jobs:
         id: create_issue
         env:
           GH_TOKEN: ${{ github.token }}
+          ISSUE_BODY: ${{ steps.body.outputs.body }}
         run: |
           issue_url=$(gh issue create \
             --title "Upstream update available: keep Railway deployment current" \
-            --body "${{ steps.body.outputs.body }}")
+            --body "$ISSUE_BODY")
           echo "issue_url=$issue_url" >> "$GITHUB_OUTPUT"
           echo "issue_number=$(basename "$issue_url")" >> "$GITHUB_OUTPUT"
 
