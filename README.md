@@ -144,6 +144,8 @@ Once Paperclip is running, this wrapper is transparent — it proxies public tra
 
 Paperclip is intentionally declared as `latest` in `package.json` and refreshed on every container start by `scripts/start.mjs`. Do not pin its version: new upstream releases are applied automatically on Railway restarts and redeploys.
 
+Security overrides update Better Auth, Svix, and Zod. Paperclip's published server also bundles an older Zod copy, which is replaced with the patched version during image builds and after startup updates. npm audit may still report that bundled copy from upstream package metadata.
+
 This repo requires **Node.js 24.15.0 or higher** (see `package.json` and `Dockerfile`). If upstream Paperclip bumps its Node requirement, update both files accordingly.
 
 ## Keeping this fork up to date

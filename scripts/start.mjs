@@ -23,6 +23,7 @@ import { spawn, spawnSync } from "child_process";
 import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
+import { patchBundledZod } from "./patch-bundled-zod.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -859,6 +860,7 @@ const shouldSeedGeminiConfig =
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   updatePaperclip();
+  patchBundledZod();
   enforceAgentRetryPolicy();
   enforceGeminiAcpModelCompatibility();
   if (shouldSeedGeminiConfig) {

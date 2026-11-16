@@ -1,10 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:http";
 import { enforceAgentRetryPolicy, enforceGeminiAcpModelCompatibility, watchPaperclipReadiness } from "./start.mjs";
+import { patchBundledZod } from "./patch-bundled-zod.mjs";
 
 const recovery = `export function classifyAdapterFailureForRecovery(latestRun) {
     if (latestRun.errorCode === "adapter_engine_unavailable" || latestRun.errorCode === "provider_tool_definition_invalid" || latestRun.errorCode === "native_provider_model_rejected") {
@@ -125,6 +126,7 @@ test("readiness waits for a successful health response", async () => {
     res.writeHead(requests === 1 ? 503 : 200);
     res.end(JSON.stringify({ status: requests < 3 ? "starting" : "ok" }));
   });
+
   await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
   try {
     await new Promise((resolve, reject) => {
@@ -137,5 +139,31 @@ test("readiness waits for a successful health response", async () => {
     assert.ok(requests >= 3);
   } finally {
     await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test("replaces vulnerable bundled Zod and preserves newer versions", () => {
+  const root = mkdtempSync(join(tmpdir(), "paperclip-zod-"));
+  const source = join(root, "node_modules", "zod");
+  const bundled = join(root, "node_modules", "@paperclipai", "server", "node_modules", "zod");
+  try {
+    mkdirSync(source, { recursive: true });
+    mkdirSync(bundled, { recursive: true });
+    writeFileSync(join(root, "package.json"), JSON.stringify({ overrides: { zod: "4.6.7" } }));
+    writeFileSync(join(source, "package.json"), JSON.stringify({ version: "4.6.7" }));
+    writeFileSync(join(source, "fixed.js"), "fixed");
+    writeFileSync(join(bundled, "package.json"), JSON.stringify({ version: "4.4.3" }));
+    writeFileSync(join(bundled, "obsolete.js"), "old");
+    patchBundledZod(root);
+    assert.equal(JSON.parse(readFileSync(join(bundled, "package.json"))).version, "4.6.7");
+    assert.equal(readFileSync(join(bundled, "fixed.js"), "utf8"), "fixed");
+    assert.throws(() => readFileSync(join(bundled, "obsolete.js")));
+    writeFileSync(join(bundled, "package.json"), JSON.stringify({ version: "4.7.0" }));
+    patchBundledZod(root);
+    assert.equal(JSON.parse(readFileSync(join(bundled, "package.json"))).version, "4.7.0");
+    writeFileSync(join(source, "package.json"), JSON.stringify({ version: "4.4.3" }));
+    assert.throws(() => patchBundledZod(root), /Cannot safely update/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });

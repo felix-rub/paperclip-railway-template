@@ -17,7 +17,8 @@ WORKDIR /app
 
 # Copy package files and install dependencies
 COPY package.json ./
-RUN npm install --omit=dev
+COPY scripts/patch-bundled-zod.mjs ./scripts/
+RUN npm install --omit=dev && node scripts/patch-bundled-zod.mjs
 
 # Copy application code
 COPY . .
