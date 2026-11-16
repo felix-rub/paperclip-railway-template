@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { enforceAgentRetryPolicy, enforceGeminiAcpModelCompatibility } from "./start.mjs";
+import { createServer } from "node:http";
+import { enforceAgentRetryPolicy, enforceGeminiAcpModelCompatibility, watchPaperclipReadiness } from "./start.mjs";
 
 const recovery = `export function classifyAdapterFailureForRecovery(latestRun) {
     if (latestRun.errorCode === "adapter_engine_unavailable" || latestRun.errorCode === "provider_tool_definition_invalid" || latestRun.errorCode === "native_provider_model_rejected") {
@@ -114,4 +115,27 @@ test("Gemini uses upstream startup model and skips unsupported ACP options", () 
     enforceGeminiAcpModelCompatibility(path);
     assert.equal(readFileSync(path, "utf8"), patched);
   });
+});
+
+test("readiness waits for a successful health response", async () => {
+  let requests = 0;
+  const server = createServer((req, res) => {
+    assert.equal(req.url, "/api/health");
+    requests++;
+    res.writeHead(requests === 1 ? 503 : 200);
+    res.end(JSON.stringify({ status: requests < 3 ? "starting" : "ok" }));
+  });
+  await new Promise(resolve => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => { cancel(); reject(new Error("health check timed out")); }, 2000);
+      const cancel = watchPaperclipReadiness(server.address().port, () => {
+        clearTimeout(timeout);
+        resolve();
+      }, 10);
+    });
+    assert.ok(requests >= 3);
+  } finally {
+    await new Promise(resolve => server.close(resolve));
+  }
 });

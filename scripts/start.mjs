@@ -72,6 +72,7 @@ function stripAnsi(str) {
 
 let paperclipProc = null;
 let paperclipReady = false;
+let cancelReadiness = null;
 let inviteUrl = null;
 let bootstrapSkippedReason = null;
 let bootstrapAttempted = false; // guards the one-shot auto-generate after Paperclip is ready
@@ -495,6 +496,64 @@ function seedGeminiConfig() {
 
 // ── Paperclip process ─────────────────────────────────────────────────────────
 
+export function watchPaperclipReadiness(port, onReady, intervalMs = 1000) {
+  let stopped = false;
+  let timer;
+  let request;
+  function retry() {
+    if (!stopped) timer = setTimeout(probe, intervalMs);
+  }
+  function probe() {
+    if (stopped) return;
+    request = httpRequest({ hostname: "127.0.0.1", port, path: "/api/health", timeout: 3000 }, res => {
+      if (res.statusCode !== 200) {
+        res.resume();
+        retry();
+        return;
+      }
+      let body = "";
+      res.setEncoding("utf8");
+      res.on("data", chunk => { body += chunk; });
+      res.on("error", err => {
+        if (!stopped) console.warn(`Paperclip health response failed: ${err.message}`);
+        retry();
+      });
+      res.on("end", () => {
+        if (stopped) return;
+        let health;
+        try {
+          health = JSON.parse(body);
+        } catch (err) {
+          console.warn(`Invalid Paperclip health response: ${err.message}`);
+          retry();
+          return;
+        }
+        if (health?.status === "ok") {
+          stopped = true;
+          onReady();
+        } else {
+          retry();
+        }
+      });
+    });
+    request.on("timeout", () => request.destroy(new Error("Paperclip health check timed out")));
+    request.on("error", err => {
+      if (stopped) return;
+      if (!["ECONNREFUSED", "ECONNRESET"].includes(err.code) && err.message !== "Paperclip health check timed out") {
+        console.warn(`Paperclip health check failed: ${err.message}`);
+      }
+      retry();
+    });
+    request.end();
+  }
+  probe();
+  return () => {
+    stopped = true;
+    clearTimeout(timer);
+    request?.destroy();
+  };
+}
+
 function startPaperclip() {
   if (paperclipProc) return; // already running
 
@@ -543,35 +602,35 @@ function startPaperclip() {
       console.log(`\n⚠️ Bootstrap invite skipped: admin already exists.\n`);
     }
 
-    // Detect ready
-    if (!paperclipReady && (text.includes("Server listening on") || text.includes("server listening"))) {
-      paperclipReady = true;
-      console.log(`\n✅ Paperclip ready — proxying :${PUBLIC_PORT} → :${PAPERCLIP_PORT}\n`);
-
-      // Current Paperclip versions no longer print the first-admin bootstrap invite on `run`
-      // (they show a "waiting on first admin" page instead). If we didn't capture one from
-      // stdout, generate it ourselves so the Manage tab's registration link appears automatically.
-      if (!inviteUrl && !bootstrapSkippedReason && !bootstrapAttempted) {
-        bootstrapAttempted = true;
-        setTimeout(() => {
-          if (!inviteUrl && !bootstrapSkippedReason) {
-            console.log("\nℹ️ No bootstrap invite seen at startup — generating first-admin invite...\n");
-            generateBootstrapInvite(false);
-          }
-        }, 1500);
-      }
-    }
   });
 
   paperclipProc.stderr.on("data", chunk => process.stderr.write(chunk));
 
+  cancelReadiness = watchPaperclipReadiness(PAPERCLIP_PORT, () => {
+    paperclipReady = true;
+    console.log(`\n✅ Paperclip ready — proxying :${PUBLIC_PORT} → :${PAPERCLIP_PORT}\n`);
+    if (!inviteUrl && !bootstrapSkippedReason && !bootstrapAttempted) {
+      bootstrapAttempted = true;
+      setTimeout(() => {
+        if (!inviteUrl && !bootstrapSkippedReason) {
+          console.log("\nℹ️ No bootstrap invite seen at startup — generating first-admin invite...\n");
+          generateBootstrapInvite(false);
+        }
+      }, 1500);
+    }
+  });
+
   paperclipProc.on("error", err => {
     console.error("Paperclip process error:", err);
+    cancelReadiness?.();
+    cancelReadiness = null;
     paperclipProc = null;
     paperclipReady = false;
   });
 
   paperclipProc.on("exit", (code) => {
+    cancelReadiness?.();
+    cancelReadiness = null;
     console.log(`Paperclip exited with code ${code}`);
     // Railway will restart the whole container on exit — don't try to restart here
     process.exit(code ?? 1);
@@ -618,6 +677,8 @@ function generateBootstrapInvite(force = false) {
 
 function stopPaperclip() {
   if (!paperclipProc) return;
+  cancelReadiness?.();
+  cancelReadiness = null;
   paperclipReady = false;
   paperclipProc.kill("SIGTERM");
   paperclipProc = null;

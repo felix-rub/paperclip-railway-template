@@ -66,7 +66,7 @@ npm start
         ├── when "Go to Manage" is clicked and env vars are ready:
         │     write minimal config.json to PAPERCLIP_HOME
         │     spawn: paperclipai run
-        │     proxy :3100 → internal Paperclip on :3099
+        │     proxy :3100 → internal Paperclip on :3099 after /api/health responds
         └── env var readiness is derived from reality (config.json + required env vars);
             there is no SETUP_COMPLETE env var or .setup_complete flag file
 ```
