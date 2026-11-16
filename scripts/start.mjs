@@ -20,7 +20,7 @@
 import { createServer, request as httpRequest } from "http";
 import { readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, unlinkSync } from "fs";
 import { spawn, spawnSync } from "child_process";
-import { join, dirname } from "path";
+import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
 
@@ -110,49 +110,88 @@ function updatePaperclip() {
 // Paperclip's recovery policy is not configurable. Keep the runtime at latest,
 // but make every failed agent execution eligible for another recovery attempt
 // on the next 60-second scheduler tick.
-function enforceAgentRetryPolicy() {
-  let source = readFileSync(PAPERCLIP_RECOVERY_SERVICE_PATH, "utf8");
+export function enforceAgentRetryPolicy(path = PAPERCLIP_RECOVERY_SERVICE_PATH) {
+  let source = readFileSync(path, "utf8");
+  const engineBlocker = `if (latestRun.errorCode === "adapter_engine_unavailable" || latestRun.errorCode === "provider_tool_definition_invalid" || latestRun.errorCode === "native_provider_model_rejected") {
+        return { kind: "configuration_incomplete" };
+    }`;
+  if (source.includes(engineBlocker)) {
+    source = source.replace(engineBlocker, engineBlocker.replace('return { kind: "configuration_incomplete" };', "return null;"));
+  }
+  const multilineConfiguration = `if (latestRun.errorCode === "configuration_incomplete" ||
+        CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {
+        return { kind: "configuration_incomplete" };
+    }`;
+  const multilineNonRetryable = `return {
+            kind: "non_retryable",
+            maxAttempts: 0,
+            baseBackoffMs: 0,
+            errorCode,
+        };`;
   const replacements = [
     [
-      "if (latestRun.errorCode === \"configuration_incomplete\" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {\n        return { kind: \"configuration_incomplete\" };\n    }",
-      "if (latestRun.errorCode === \"configuration_incomplete\" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {\n        return null;\n    }",
+      [
+        "if (latestRun.errorCode === \"configuration_incomplete\" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {\n        return { kind: \"configuration_incomplete\" };\n    }",
+        multilineConfiguration,
+      ],
+      [
+        "if (latestRun.errorCode === \"configuration_incomplete\" || CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)) {\n        return null;\n    }",
+        multilineConfiguration.replace('return { kind: "configuration_incomplete" };', "return null;"),
+      ],
     ],
     [
-      "return { kind: \"non_retryable\", maxAttempts: 0, baseBackoffMs: 0, errorCode };",
-      "return { kind: \"default\", maxAttempts: Number.MAX_SAFE_INTEGER, baseBackoffMs: 60_000, errorCode };",
+      ["return { kind: \"non_retryable\", maxAttempts: 0, baseBackoffMs: 0, errorCode };", multilineNonRetryable],
+      [
+        "return { kind: \"default\", maxAttempts: Number.MAX_SAFE_INTEGER, baseBackoffMs: 60_000, errorCode };",
+        `return {
+            kind: "default",
+            maxAttempts: Number.MAX_SAFE_INTEGER,
+            baseBackoffMs: 60_000,
+            errorCode,
+        };`,
+      ],
     ],
     [
-      "maxAttempts: CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS,",
-      "maxAttempts: Number.MAX_SAFE_INTEGER,",
+      ["maxAttempts: CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS,\n            baseBackoffMs: CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS,"],
+      ["maxAttempts: Number.MAX_SAFE_INTEGER,\n            baseBackoffMs: CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS,"],
     ],
     [
-      "maxAttempts: CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS,\n        baseBackoffMs: 0,",
-      "maxAttempts: Number.MAX_SAFE_INTEGER,\n        baseBackoffMs: 60_000,",
+      ["maxAttempts: CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS,\n        baseBackoffMs: 0,"],
+      ["maxAttempts: Number.MAX_SAFE_INTEGER,\n        baseBackoffMs: 60_000,"],
     ],
     [
-      "const requiredDelay = classification.baseBackoffMs *\n                            Math.pow(2, Math.max(0, consecutive - 1));",
-      "const requiredDelay = classification.baseBackoffMs;",
+      ["const requiredDelay = classification.baseBackoffMs *\n                            Math.pow(2, Math.max(0, consecutive - 1));"],
+      ["const requiredDelay = classification.baseBackoffMs;"],
     ],
     [
-      "const retryAt = readProviderQuotaRetryAt(input.latestRun, now);",
-      "const retryAt = new Date(now.getTime() + 60_000);",
+      ["const retryAt = readProviderQuotaRetryAt(input.latestRun, now);"],
+      ["const retryAt = new Date(now.getTime() + 60_000);"],
     ],
   ];
 
-  for (const [before, after] of replacements) {
-    const occurrences = source.split(before).length - 1;
-    if (occurrences === 1) {
-      source = source.replace(before, after);
+  for (const [beforeVariants, afterVariants] of replacements) {
+    const matches = beforeVariants.flatMap((before, index) =>
+      Array(source.split(before).length - 1).fill(index));
+    if (matches.length === 1) {
+      const index = matches[0];
+      source = source.replace(beforeVariants[index], afterVariants[index]);
       continue;
     }
-    if (occurrences !== 0 || !source.includes(after)) {
-      throw new Error(`Could not apply the Paperclip retry-policy patch: expected one match for ${JSON.stringify(before)}.`);
+    if (matches.length !== 0 || !afterVariants.some(after => source.includes(after))) {
+      throw new Error(`Could not apply the Paperclip retry-policy patch: expected one match for ${JSON.stringify(beforeVariants)}.`);
     }
   }
 
-  const tmpPath = `${PAPERCLIP_RECOVERY_SERVICE_PATH}.tmp-${process.pid}`;
+  const classifierStart = source.indexOf("function classifyAdapterFailureForRecovery(");
+  const classifierEnd = source.indexOf("\nexport function classifyContinuationFailure(", classifierStart);
+  if (classifierStart < 0 || classifierEnd < 0 ||
+      source.slice(classifierStart, classifierEnd).includes('return { kind: "configuration_incomplete" };')) {
+    throw new Error("Could not remove all Paperclip adapter configuration blockers.");
+  }
+
+  const tmpPath = `${path}.tmp-${process.pid}`;
   writeFileSync(tmpPath, source, { mode: 0o644 });
-  renameSync(tmpPath, PAPERCLIP_RECOVERY_SERVICE_PATH);
+  renameSync(tmpPath, path);
   console.log("   Enforced unlimited 60-second retries for failed agent runs.");
 }
 
@@ -161,8 +200,8 @@ function enforceAgentRetryPolicy() {
 // session/set_model method, so that request fails with ACP -32601 before the
 // first prompt. Apply the pending upstream fix: select Gemini's model with its
 // startup --model flag and skip all unsupported dynamic config requests.
-function enforceGeminiAcpModelCompatibility() {
-  let source = readFileSync(PAPERCLIP_ACPX_EXECUTOR_PATH, "utf8");
+export function enforceGeminiAcpModelCompatibility(path = PAPERCLIP_ACPX_EXECUTOR_PATH) {
+  let source = readFileSync(path, "utf8");
   let changed = false;
   const geminiModelBefore = `    if (acpxAgent === "gemini" && agentCommandShell) {
         const normalized = await normalizeGeminiAcpCommandShell(agentCommandShell, ensurePathInEnv({ ...process.env, ...env }));
@@ -190,9 +229,10 @@ function enforceGeminiAcpModelCompatibility() {
   }
 
   const geminiModelStableMarker =
-    /acpxAgent\s*===\s*"gemini"\s*&&\s*agentCommandShell/.test(source) &&
+    /if \(requestedModel && acpxAgent === "gemini"\) \{\s*env\.GEMINI_MODEL = requestedModel;\s*\}/.test(source) ||
+    (/acpxAgent\s*===\s*"gemini"\s*&&\s*agentCommandShell/.test(source) &&
     /agentCommandShell\s*=\s*`\$\{agentCommandShell\}\s+--model\s+\$\{shellQuote\(requestedModel\)\}`;/.test(source) &&
-    (/--model\(\?:\\\\s\|=\)\|-m\(\?:\\\\s\|=\)/.test(source) || /--model(?:\s|=)|-m(?:\s|=)/.test(source));
+    (/--model\(\?:\\\\s\|=\)\|-m\(\?:\\\\s\|=\)/.test(source) || /--model(?:\s|=)|-m(?:\s|=)/.test(source)));
 
   const geminiModelOccurrences = source.split(geminiModelBefore).length - 1;
   if (geminiModelOccurrences === 1) {
@@ -263,10 +303,32 @@ function enforceGeminiAcpModelCompatibility() {
     throw new Error("Could not apply the Paperclip Gemini ACP session-config patch.");
   }
 
+  const sessionConfigStart = source.indexOf("function sessionConfigOptions(prepared) {");
+  const sessionConfigEnd = source.indexOf("\n}", sessionConfigStart);
+  if (sessionConfigStart < 0 || sessionConfigEnd < 0) {
+    throw new Error("Could not locate Paperclip ACP session options.");
+  }
+  let sessionConfig = source.slice(sessionConfigStart, sessionConfigEnd + 2);
+  if (!/if \(prepared\.requestedModel\s*&&[\s\S]*?prepared\.acpxAgent !== "gemini"\)/.test(sessionConfig) &&
+      !/if \(prepared\.acpxAgent === "gemini"\)\s*\{\s*return options;\s*\}/.test(sessionConfig)) {
+    throw new Error("Could not protect Gemini ACP model from unsupported session options.");
+  }
+  for (const option of ["requestedThinkingEffort", "fastMode"]) {
+    const before = `if (prepared.${option} && prepared.acpxAgent !== "codex") {`;
+    const after = `if (prepared.${option} && prepared.acpxAgent !== "codex" && prepared.acpxAgent !== "gemini") {`;
+    if (sessionConfig.includes(before)) {
+      sessionConfig = sessionConfig.replace(before, after);
+      changed = true;
+    } else if (!new RegExp(`if \\(prepared\\.${option}\\s*&&\\s*prepared\\.acpxAgent !== "codex"\\s*&&\\s*prepared\\.acpxAgent !== "gemini"\\)`).test(sessionConfig)) {
+      throw new Error(`Could not protect Gemini ACP ${option} from unsupported session options.`);
+    }
+  }
+  source = source.slice(0, sessionConfigStart) + sessionConfig + source.slice(sessionConfigEnd + 2);
+
   if (changed) {
-    const tmpPath = `${PAPERCLIP_ACPX_EXECUTOR_PATH}.tmp-${process.pid}`;
+    const tmpPath = `${path}.tmp-${process.pid}`;
     writeFileSync(tmpPath, source, { mode: 0o644 });
-    renameSync(tmpPath, PAPERCLIP_ACPX_EXECUTOR_PATH);
+    renameSync(tmpPath, path);
   }
   console.log("   Enforced Gemini ACP model compatibility.");
 }
@@ -734,14 +796,16 @@ const shouldSeedGeminiConfig =
   !!process.env.RAILWAY_PROJECT_ID ||
   !!process.env.RAILWAY_SERVICE_ID;
 
-updatePaperclip();
-enforceAgentRetryPolicy();
-enforceGeminiAcpModelCompatibility();
-if (shouldSeedGeminiConfig) {
-  seedGeminiConfig();
-}
-startServer();
+if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  updatePaperclip();
+  enforceAgentRetryPolicy();
+  enforceGeminiAcpModelCompatibility();
+  if (shouldSeedGeminiConfig) {
+    seedGeminiConfig();
+  }
+  startServer();
 
-if (isReady()) {
-  startPaperclip();
+  if (isReady()) {
+    startPaperclip();
+  }
 }
