@@ -19,6 +19,7 @@ const recovery = `export function classifyAdapterFailureForRecovery(latestRun) {
     }
 }
 export function classifyContinuationFailure(latestRun) {
+    const errorCode = readNonEmptyString(latestRun?.errorCode);
     return {
             kind: "non_retryable",
             maxAttempts: 0,

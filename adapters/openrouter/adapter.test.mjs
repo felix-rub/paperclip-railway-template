@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { createServerAdapter } from "./index.mjs";
 import { createCatalog, toRuntimeModel } from "./catalog.mjs";
 import { assertHarnessTestPassed } from "../../node_modules/@paperclipai/server/dist/services/agent-harness-verification.js";
+import { createGuard, createIssueTools, routeRequest } from "./policy.mjs";
 
 const model = {
   id: "example/tool-model", name: "Example tool model",
@@ -14,6 +15,62 @@ const model = {
 };
 const fakeKey = "test-only-not-a-real-credential";
 const fetchCatalog = async () => ({ ok: true, json: async () => ({ data: [model] }) });
+
+test("compact completion requires the exact successful check after changes", async () => {
+  const state = {};
+  const issueId = "11111111-2222-4333-8444-555555555555";
+  const requests = [];
+  const verificationCommand = "npm test";
+  const issue = createIssueTools({
+    env: { PAPERCLIP_API_URL: "http://localhost:3000/api/", PAPERCLIP_API_KEY: fakeKey, PAPERCLIP_RUN_ID: "run" },
+    issueId, verificationCommand, state,
+    fetchImpl: async (url, options) => {
+      requests.push([url, JSON.parse(options.body), options.headers["X-Paperclip-Run-Id"]]);
+      return Response.json({ status: JSON.parse(options.body).status });
+    },
+  });
+  const guard = createGuard({ verificationCommand, maxToolCalls: 30, maxRunInputTokens: 200 }, state);
+  const done = { status: "done", evidence: "Tests passed." };
+  await assert.rejects(issue.setStatus(done), /verification command/);
+  guard.beforeTool({ toolName: "bash", toolCallId: "1", input: { command: verificationCommand } });
+  guard.afterTool({ toolCallId: "1", isError: true });
+  await assert.rejects(issue.setStatus(done), /verification command/);
+  guard.beforeTool({ toolName: "bash", toolCallId: "2", input: { command: verificationCommand } });
+  guard.afterTool({ toolCallId: "2", isError: false });
+  guard.beforeTool({ toolName: "write", toolCallId: "3", input: { path: "file" } });
+  guard.afterTool({ toolCallId: "3", isError: false });
+  await assert.rejects(issue.setStatus(done), /verification command/);
+  assert.deepEqual(requests, []);
+  await issue.setStatus({ status: "blocked", evidence: "Dependency unavailable." });
+  assert.deepEqual(requests, [[`http://localhost:3000/api/issues/${issueId}`,
+    { status: "blocked", comment: "Dependency unavailable." }, "run"]]);
+  await assert.rejects(issue.setStatus(done), /already submitted/);
+});
+
+test("compact guard blocks the third duplicate and counts cached input against budget", () => {
+  const state = {};
+  const guard = createGuard({ maxToolCalls: 30, maxRunInputTokens: 100 }, state);
+  const event = { toolName: "read", input: { path: "a" } };
+  assert.equal(guard.beforeTool(event), undefined);
+  assert.equal(guard.beforeTool(event), undefined);
+  assert.equal(guard.beforeTool(event).block, true);
+  assert.equal(state.stop, "openrouter_tool_loop");
+  const budgetState = {};
+  createGuard({ maxToolCalls: 30, maxRunInputTokens: 100 }, budgetState)
+    .afterMessage({ role: "assistant", usage: { input: 20, cacheRead: 80 } });
+  assert.equal(budgetState.stop, "openrouter_input_budget");
+});
+
+test("routing requests an ordered fallback and preserves provider-specific cache markers", () => {
+  const payload = {
+    model: "anthropic/claude-haiku-5.5",
+    messages: [{ role: "system", content: [{ type: "text", text: "prefix", cache_control: { type: "ephemeral" } }] }],
+  };
+  const routed = routeRequest(payload, ["example/tool-model"]);
+  assert.deepEqual(routed.models, [payload.model, "example/tool-model"]);
+  assert.equal(routed.provider.require_parameters, true);
+  assert.deepEqual(routed.messages, payload.messages);
+});
 
 test("adapter routes exclusively to OpenRouter and preserves lifecycle, session and usage hooks", async () => {
   const controller = new AbortController();

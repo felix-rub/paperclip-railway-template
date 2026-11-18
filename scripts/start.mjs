@@ -192,6 +192,12 @@ export function enforceAgentRetryPolicy(path = PAPERCLIP_RECOVERY_SERVICE_PATH) 
       source.slice(classifierStart, classifierEnd).includes('return { kind: "configuration_incomplete" };')) {
     throw new Error("Could not remove all Paperclip adapter configuration blockers.");
   }
+  const continuation = /export function classifyContinuationFailure\(latestRun\) \{\r?\n    const errorCode = readNonEmptyString\(latestRun\?\.errorCode\);/;
+  const compactStop = '\n    if (/^openrouter_(tool_loop|tool_budget|input_budget|issue_unfinished|policy_unavailable|issue_tools_unavailable)$/.test(errorCode ?? "")) {\n        return { kind: "non_retryable", errorCode, maxAttempts: 0, baseBackoffMs: 0 };\n    }';
+  if (!source.includes(compactStop)) {
+    if (!continuation.test(source)) throw new Error("Could not install bounded OpenRouter recovery policy.");
+    source = source.replace(continuation, value => value + compactStop);
+  }
 
   const tmpPath = `${path}.tmp-${process.pid}`;
   writeFileSync(tmpPath, source, { mode: 0o644 });

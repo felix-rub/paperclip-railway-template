@@ -1,6 +1,24 @@
 import * as piRuntime from "@paperclipai/adapter-pi-local/server";
 import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createCatalog } from "./catalog.mjs";
+import { COMPACT_PROMPT } from "./policy.mjs";
+
+const POLICY_PATH = fileURLToPath(new URL("./pi-policy.mjs", import.meta.url));
+const GUARD_STOPS = new Set(["openrouter_tool_loop", "openrouter_tool_budget", "openrouter_input_budget"]);
+
+function positiveInt(value, field, fallback) {
+  const parsed = value ?? fallback;
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) throw new Error(`${field} must be a positive integer.`);
+  return parsed;
+}
+
+function failResult(errorCode, errorMessage, result = {}) {
+  return { ...result, exitCode: 1, signal: null, timedOut: false, errorCode, errorMessage };
+}
 
 const INSTALL_COMMAND = "npm install -g @earendil-works/pi-coding-agent@0.78.1";
 const DOC = `# OpenRouter adapter
@@ -46,10 +64,7 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
     }
     const env = prepareEnvironment(config);
     const model = await catalog.resolve(config.model);
-    const maxOutputTokens = config.maxOutputTokens ?? 4096;
-    if (!Number.isSafeInteger(maxOutputTokens) || maxOutputTokens <= 0) {
-      throw new Error("OpenRouter maxOutputTokens must be a positive integer.");
-    }
+    const maxOutputTokens = positiveInt(config.maxOutputTokens, "OpenRouter maxOutputTokens", 4096);
     model.maxTokens = Math.min(model.maxTokens, maxOutputTokens);
     const thinking = config.thinking || "off";
     if (!["off", "minimal", "low", "medium", "high", "xhigh"].includes(thinking)) {
@@ -58,12 +73,15 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
     if (thinking !== "off" && !model.reasoning) {
       throw new Error("The selected OpenRouter model does not advertise reasoning support. Set thinking to off.");
     }
-    const timeoutSec = config.timeoutSec ?? 300;
+    const profile = config.profile ?? "standard";
+    if (!["standard", "compact"].includes(profile)) throw new Error("OpenRouter profile must be standard or compact.");
+    const timeoutSec = config.timeoutSec ?? (profile === "compact" ? 600 : 300);
     if (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec <= 0) {
       throw new Error("OpenRouter timeoutSec must be a positive number.");
     }
     return {
       ...config,
+      profile,
       command: "pi",
       model: `openrouter/${model.id}`,
       thinking,
@@ -80,6 +98,88 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
         }),
       },
     };
+  }
+  async function preparePolicy(config, ctx) {
+    const compact = config.profile === "compact" && Boolean(ctx.context?.taskId || ctx.context?.issueId);
+    const fallbackList = config.fallbackModels ?? "";
+    if (typeof fallbackList !== "string") throw new Error("OpenRouter fallbacks must be a comma-separated model list.");
+    const requested = fallbackList.split(/[,\n]/).map(id => id.trim()).filter(Boolean);
+    if (requested.length > 3) throw new Error("Configure at most three OpenRouter fallbacks.");
+    const fallbacks = (await Promise.all(requested.map(id => catalog.resolve(id))))
+      .filter(model => config.model !== `openrouter/${model.id}`);
+    const fallbackModels = [...new Set(fallbacks.map(model => model.id))];
+    if (config.escalationModel != null && typeof config.escalationModel !== "string") {
+      throw new Error("Escalation model must be text.");
+    }
+    const escalation = compact && config.escalationModel?.trim() ? await catalog.resolve(config.escalationModel) : null;
+    if (escalation && config.model === `openrouter/${escalation.id}`) {
+      throw new Error("Escalation requires a different model.");
+    }
+    if (config.verificationCommand != null && typeof config.verificationCommand !== "string") {
+      throw new Error("Verification command must be text.");
+    }
+    if ((compact || fallbackModels.length) && ctx.executionTarget?.kind === "remote") {
+      throw new Error("OpenRouter compact mode and fallback routing currently require the local Railway runtime.");
+    }
+    if (fallbacks.length) {
+      const providers = JSON.parse(config.env.PAPERCLIP_PI_PROVIDERS);
+      const primary = providers.openrouter.models[0];
+      primary.contextWindow = Math.min(primary.contextWindow, ...fallbacks.map(model => model.contextWindow));
+      primary.maxTokens = Math.min(primary.maxTokens, ...fallbacks.map(model => model.maxTokens));
+      config.env.PAPERCLIP_PI_PROVIDERS = JSON.stringify(providers);
+    }
+    return {
+      compact, fallbackModels, escalation,
+      issueId: ctx.context?.taskId || ctx.context?.issueId,
+      verificationCommand: config.verificationCommand?.trim(),
+      maxToolCalls: positiveInt(config.maxToolCalls, "OpenRouter maxToolCalls", 30),
+      maxRunInputTokens: positiveInt(config.maxRunInputTokens, "OpenRouter maxRunInputTokens", 80_000),
+    };
+  }
+
+  async function runPolicy(ctx, config, policy) {
+    const dir = await mkdtemp(join(tmpdir(), "paperclip-openrouter-"));
+    const outcome = join(dir, "outcome.json");
+    try {
+      const { escalation, ...settings } = policy;
+      const attempt = {
+        ...config,
+        ...(policy.compact ? {
+          promptTemplate: COMPACT_PROMPT,
+          extraArgs: ["--no-extensions", "--no-skills", "--tools",
+            "read,bash,edit,write,grep,find,ls,paperclip_get_task,paperclip_comment,paperclip_set_status"],
+        } : { extraArgs: [] }),
+        env: {
+          ...config.env,
+          PAPERCLIP_OPENROUTER_POLICY: JSON.stringify({ ...settings, outcome }),
+        },
+      };
+      if (policy.compact) {
+        for (const key of ["PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID"]) delete attempt.env[key];
+      }
+      attempt.extraArgs.push("--extension", POLICY_PATH);
+      const result = await runtime.execute({ ...ctx, config: attempt });
+      if (!policy.compact) return { result, state: {} };
+      let state;
+      try {
+        state = JSON.parse(await readFile(outcome, "utf8"));
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+        return { result: result.exitCode === 0 ? failResult("openrouter_policy_unavailable", "Compact policy did not initialize.", result) : result, state: {} };
+      }
+      if (state.terminal && !result.timedOut && !result.signal) {
+        return { result: { ...result, exitCode: 0, errorCode: null, errorMessage: null, summary: "" }, state };
+      }
+      if (state.stop) {
+        return { result: failResult(state.stop, "OpenRouter compact policy stopped this run before any further work.", result), state };
+      }
+      if (result.exitCode === 0) {
+        return { result: failResult("openrouter_issue_unfinished", "Model exited without recording a verified issue outcome.", result), state };
+      }
+      return { result, state };
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   }
   return {
     type: "openrouter",
@@ -107,8 +207,17 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
           {
             key: "model", label: "OpenRouter model", type: "combobox", required: true,
             options: (await catalog.list()).map(model => ({ value: model.id, label: model.label })),
-            hint: "Tool-capable OpenRouter models. Add OPENROUTER_API_KEY through the environment editor using a secret reference.",
+            hint: "Add OPENROUTER_API_KEY as a secret reference. Free models can be rate-limited and are best for smoke tests.",
           },
+          { key: "profile", label: "Execution profile", type: "select", default: "standard",
+            options: [{ value: "standard", label: "Standard" }, { value: "compact", label: "Compact (issue runs)" }] },
+          { key: "verificationCommand", label: "Compact verification command", type: "text",
+            hint: "Operator-reviewed shell check. Compact tools cannot mark done without a passing check." },
+          { key: "maxToolCalls", label: "Compact tool-call budget", type: "number", default: 30 },
+          { key: "maxRunInputTokens", label: "Compact input-token budget per attempt", type: "number", default: 80000 },
+          { key: "fallbackModels", label: "Fallback models (comma-separated)", type: "text" },
+          { key: "escalationModel", label: "Escalation model (optional)", type: "text",
+            hint: "One extra attempt if the first did not finish and made no changes." },
           {
             key: "thinking", label: "Thinking", type: "select", default: "off",
             options: ["off", "minimal", "low", "medium", "high", "xhigh"].map(value => ({ value, label: value })),
@@ -117,7 +226,7 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
           { key: "cwd", label: "Working directory", type: "text" },
           { key: "instructionsFilePath", label: "Instructions file", type: "text" },
           { key: "promptTemplate", label: "Prompt template", type: "textarea" },
-          { key: "timeoutSec", label: "Run timeout (seconds)", type: "number", default: 300 },
+          { key: "timeoutSec", label: "Run timeout (seconds)", type: "number", hint: "Defaults: standard 300s, compact 600s." },
           { key: "maxOutputTokens", label: "Maximum output tokens per turn", type: "number", default: 4096 },
           { key: "graceSec", label: "Termination grace (seconds)", type: "number", default: 20 },
         ],
@@ -125,8 +234,10 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
     },
     async execute(ctx) {
       let config;
+      let policy;
       try {
         config = await prepareConfig(ctx.config);
+        policy = await preparePolicy(config, ctx);
       } catch (error) {
         const message = errorText(error);
         await ctx.onLog("stderr", `${message}\n`);
@@ -135,10 +246,26 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
           errorCode: "configuration_incomplete", errorMessage: message,
         };
       }
-      return runtime.execute({
+      const forwarded = {
         ...ctx, config,
         onMeta: ctx.onMeta ? meta => ctx.onMeta({ ...meta, adapterType: "openrouter" }) : undefined,
+      };
+      if (!policy.compact && !policy.fallbackModels.length) return runtime.execute(forwarded);
+      const started = Date.now();
+      const { result, state } = await runPolicy(forwarded, config, policy);
+      if (!policy.escalation || !ctx.onUsage || ctx.signal?.aborted || result.timedOut ||
+          state.workAttempted || state.wroteComment || state.statusAttempted ||
+          (!GUARD_STOPS.has(result.errorCode) && result.errorCode !== "openrouter_issue_unfinished")) return result;
+      const timeoutSec = config.timeoutSec - (Date.now() - started) / 1000;
+      if (timeoutSec < 5) return result;
+      await ctx.onLog("stdout", "[paperclip] OpenRouter escalating once; no work or issue update was attempted.\n");
+      const next = await prepareConfig({
+        ...ctx.config, model: policy.escalation.id, thinking: "off", timeoutSec,
       });
+      const retry = await runPolicy({ ...forwarded, runtime: { ...ctx.runtime, sessionId: null, sessionParams: null } }, next, {
+        ...policy, escalation: null, fallbackModels: [],
+      });
+      return retry.result;
     },
     async testEnvironment(ctx) {
       let config;

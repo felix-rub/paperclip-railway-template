@@ -36,11 +36,39 @@ The wrapper forwards authenticated WebSocket upgrades for live run updates.
 Catalog metadata supplies context/output limits and estimated token prices; actual
 OpenRouter billing may differ with provider routing and tiered pricing.
 
+### Compact mode for low-cost models
+
+Select **Compact (issue runs)** on one agent first; Standard remains the default.
+Compact gives the model three tools to read the current issue, post an update,
+and set `done` or `blocked`. Configure a **Compact verification command** that
+actually checks the expected outcome (for example `npm test` for a test-backed
+code task). The status tool refuses `done` unless that exact command succeeded
+after the last write, edit, or shell action. Without a verifier it can report
+`blocked`, but cannot close the issue. This is a workflow guard for trusted
+agents, not a sandbox or proof that an inadequate verifier checked the task.
+
+Compact stops the third identical tool call and defaults to 30 calls,
+80,000 reported input tokens per attempt, and 600 seconds. The input budget is
+checked after each response, so a request already sent can overshoot. Guard
+stops do not enter the wrapper's automatic continuation retry loop.
+
+Optional **Fallback models** are ordered OpenRouter slugs, attempted by OpenRouter
+when a request can't be served. **Escalation model** is a separate, one-time
+attempt for a compact run that loops or exits unfinished before attempting
+workspace changes or issue writes. Both are off by default and can incur charges.
+Start with the catalog's low-cost picks; free variants are rate-limited.
+Pi sends Anthropic-compatible ephemeral cache markers for OpenRouter Anthropic
+models; providers with automatic prefix caching may also report cached tokens.
+Cache hits and discounts depend on the routed provider and prompt length.
+
 Sessions persist under `/paperclip/openrouter/sessions`. On first boot, the wrapper
 links Pi's session directory there. It refuses to overwrite an existing Pi session
 directory or a different installed adapter named `openrouter`.
 
 For local development, run `npm install`, `npm run build`, then `npm test`.
+In a disposable Linux environment with `node_modules/.bin` on `PATH`, run
+`OPENROUTER_PI_INTEGRATION=1 node --test adapters/openrouter/pi-integration.test.mjs`
+to exercise actual Pi against local fake OpenRouter and Paperclip endpoints.
 The generated browser transcript parser is bundled from Paperclip's Pi adapter.
 The CLI is pinned to patched Pi `0.78.1`; runtime upgrades must preserve tool
 execution and session resume.

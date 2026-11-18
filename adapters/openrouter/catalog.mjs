@@ -1,4 +1,8 @@
 const MODELS_URL = "https://openrouter.ai/api/v1/models";
+const LOW_COST_PICKS = [
+  "anthropic/claude-haiku-5.5", "minimax/minimax-m3.1-flash", "deepseek/deepseek-v3.2",
+  "qwen/qwen3-coder", "openai/gpt-5-mini",
+];
 
 function pricePerMillion(value, name) {
   const parsed = typeof value === "string" && value.trim() ? Number(value) : NaN;
@@ -65,10 +69,11 @@ export function createCatalog(fetchImpl = fetch) {
   }
   return {
     async list(refresh = false) {
-      return (await entries(refresh)).map(entry => ({
-        id: entry.id,
-        label: entry.name || entry.id,
-      })).sort((a, b) => a.label.localeCompare(b.label));
+      const rank = id => LOW_COST_PICKS.includes(id) ? LOW_COST_PICKS.indexOf(id) : LOW_COST_PICKS.length;
+      return (await entries(refresh)).map(({ id, name }) => ({
+        id,
+        label: `${LOW_COST_PICKS.includes(id) ? "Low-cost pick: " : ""}${name || id}${id.endsWith(":free") ? " (free; rate limits apply)" : ""}`,
+      })).sort((a, b) => rank(a.id) - rank(b.id) || a.label.localeCompare(b.label));
     },
     async resolve(model) {
       if (typeof model !== "string" || !model.trim()) {
