@@ -170,7 +170,8 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
         return {
           adapterType: "openrouter", status: hello ? "pass" : "warn",
           checks: [{
-            code: "openrouter_hello_probe", level: hello ? "info" : "warn",
+            code: hello ? "openrouter_hello_probe_passed" : "openrouter_hello_probe_unexpected_output",
+            level: hello ? "info" : "warn",
             message: hello ? "OpenRouter engine probe succeeded." : "OpenRouter responded without the expected hello.",
           }],
           testedAt: new Date().toISOString(),

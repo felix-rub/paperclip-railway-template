@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServerAdapter } from "./index.mjs";
 import { createCatalog, toRuntimeModel } from "./catalog.mjs";
+import { assertHarnessTestPassed } from "../../node_modules/@paperclipai/server/dist/services/agent-harness-verification.js";
 
 const model = {
   id: "example/tool-model", name: "Example tool model",
@@ -117,6 +118,7 @@ test("incompatible reasoning and provider-overriding arguments never execute", a
 
 test("environment probe reports the OpenRouter adapter identity and prepared provider config", async () => {
   let tested = false;
+  let summary = "hello";
   const adapter = createServerAdapter({
     fetchImpl: fetchCatalog,
     runtime: {
@@ -127,7 +129,7 @@ test("environment probe reports the OpenRouter adapter identity and prepared pro
         assert.equal(providers.openrouter.models[0].maxTokens, 256);
         assert.equal(ctx.config.timeoutSec, 60);
         assert.deepEqual(ctx.config.extraArgs, ["--tools", "read", "--no-session"]);
-        return { exitCode: 0, summary: "hello" };
+        return { exitCode: 0, summary };
       },
     },
   });
@@ -135,6 +137,11 @@ test("environment probe reports the OpenRouter adapter identity and prepared pro
   assert.equal(tested, true);
   assert.equal(result.adapterType, "openrouter");
   assert.equal(result.status, "pass");
+  assert.doesNotThrow(() => assertHarnessTestPassed(result));
+  summary = "Unexpected response";
+  const unexpected = await adapter.testEnvironment({ config: { model: model.id, env: { OPENROUTER_API_KEY: fakeKey } } });
+  assert.equal(unexpected.status, "warn");
+  assert.throws(() => assertHarnessTestPassed(unexpected), { code: "harness_probe_unexpected_output" });
   const missing = await adapter.testEnvironment({ config: { model: model.id, env: { OPENROUTER_API_KEY: "" } } });
   assert.equal(missing.status, "fail");
   assert.equal(missing.checks[0].level, "error");
