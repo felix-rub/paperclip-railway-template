@@ -54,6 +54,8 @@ Compact stops the third identical tool call and defaults to 30 calls,
 80,000 reported input tokens per attempt, and 600 seconds. The input budget is
 checked after each response, so a request already sent can overshoot. Guard
 stops do not enter the wrapper's automatic continuation retry loop.
+Paperclip's `timeoutSec: 0` sentinel uses the bounded profile default (Standard:
+300 seconds, Compact: 600 seconds), rather than disabling the adapter timeout.
 
 Optional **Fallback models** are ordered OpenRouter slugs, attempted by OpenRouter
 when a request can't be served. **Escalation model** is a separate, one-time

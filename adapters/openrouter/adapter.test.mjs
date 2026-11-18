@@ -191,7 +191,7 @@ test("incompatible reasoning and provider-overriding arguments never execute", a
     fetchImpl: async () => ({ ok: true, json: async () => ({ data: [{ ...model, supported_parameters: ["tools"] }] }) }),
     runtime: { execute: () => assert.fail("must not run") },
   });
-  for (const overrides of [{ thinking: "high" }, { extraArgs: ["--provider", "openai"] }, { timeoutSec: 0 }]) {
+  for (const overrides of [{ thinking: "high" }, { extraArgs: ["--provider", "openai"] }, { timeoutSec: -1 }, { timeoutSec: "0" }]) {
     const result = await adapter.execute({
       config: { model: model.id, env: { OPENROUTER_API_KEY: fakeKey }, ...overrides },
       onLog: async () => {},
@@ -199,6 +199,26 @@ test("incompatible reasoning and provider-overriding arguments never execute", a
     assert.equal(result.exitCode, 1);
     assert.doesNotMatch(JSON.stringify(result), new RegExp(fakeKey));
   }
+});
+
+test("Paperclip's zero timeout sentinel uses the bounded profile default", async () => {
+  const timeouts = [];
+  const adapter = createServerAdapter({
+    fetchImpl: fetchCatalog,
+    runtime: { async execute({ config }) {
+      timeouts.push(config.timeoutSec);
+      return { exitCode: 0 };
+    } },
+  });
+  for (const [profile, timeoutSec] of [["standard", 0], ["compact", 0], ["standard", 45]]) {
+    const result = await adapter.execute({
+      config: { profile, timeoutSec, model: model.id, env: { OPENROUTER_API_KEY: fakeKey } },
+      context: {},
+      onLog: async () => {},
+    });
+    assert.equal(result.exitCode, 0, result.errorMessage);
+  }
+  assert.deepEqual(timeouts, [300, 600, 45]);
 });
 
 test("environment probe reports the OpenRouter adapter identity and prepared provider config", async () => {

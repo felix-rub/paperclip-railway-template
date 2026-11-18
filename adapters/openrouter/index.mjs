@@ -75,7 +75,8 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
     }
     const profile = config.profile ?? "standard";
     if (!["standard", "compact"].includes(profile)) throw new Error("OpenRouter profile must be standard or compact.");
-    const timeoutSec = config.timeoutSec ?? (profile === "compact" ? 600 : 300);
+    const defaultTimeoutSec = profile === "compact" ? 600 : 300;
+    const timeoutSec = config.timeoutSec === 0 ? defaultTimeoutSec : (config.timeoutSec ?? defaultTimeoutSec);
     if (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec <= 0) {
       throw new Error("OpenRouter timeoutSec must be a positive number.");
     }
