@@ -35,6 +35,9 @@ and usage accounting. This does **not** invoke OpenCode, Codex, or Claude Code.
 The wrapper forwards authenticated WebSocket upgrades for live run updates.
 Catalog metadata supplies context/output limits and estimated token prices; actual
 OpenRouter billing may differ with provider routing and tiered pricing.
+For `openrouter/free`, OpenRouter picks a free model per request and does not
+publish a fixed completion limit. The adapter caps requests at 4,096 output
+tokens (or the lower agent setting); rate limits and routed model limits still apply.
 
 ### Compact mode for low-cost models
 

@@ -158,6 +158,34 @@ test("catalog errors and unknown pricing are explicit, not empty lists or zero-c
   assert.throws(() => toRuntimeModel({ ...model, top_provider: {} }), /context\/output limits/);
 });
 
+test("OpenRouter's free router runs with null completion limits and respects a lower agent cap", async () => {
+  const free = { ...model, id: "openrouter/free", context_length: 200_000,
+    top_provider: { context_length: null, max_completion_tokens: null },
+    pricing: { prompt: "0", completion: "0" } };
+  const seen = [];
+  const adapter = createServerAdapter({
+    fetchImpl: async () => Response.json({ data: [free] }),
+    runtime: { async execute({ config }) {
+      const [runtimeModel] = JSON.parse(config.env.PAPERCLIP_PI_PROVIDERS).openrouter.models;
+      seen.push([config.model, runtimeModel.id, runtimeModel.contextWindow, runtimeModel.maxTokens, runtimeModel.cost.output]);
+      return { exitCode: 0 };
+    } },
+  });
+  for (const [model, maxOutputTokens] of [["openrouter/free", 8192], ["openrouter/openrouter/free", 512]]) {
+    const result = await adapter.execute({
+      config: { model, maxOutputTokens, env: { OPENROUTER_API_KEY: fakeKey } },
+      onLog: async () => {},
+    });
+    assert.equal(result.exitCode, 0, result.errorMessage);
+  }
+  assert.deepEqual(seen, [
+    ["openrouter/openrouter/free", "openrouter/free", 200_000, 4096, 0],
+    ["openrouter/openrouter/free", "openrouter/free", 200_000, 512, 0],
+  ]);
+  assert.throws(() => toRuntimeModel({ ...free, id: "openrouter/auto" }), /context\/output limits/);
+  assert.throws(() => toRuntimeModel({ ...free, pricing: { prompt: "-1", completion: "-1" } }), /invalid input pricing/);
+});
+
 test("incompatible reasoning and provider-overriding arguments never execute", async () => {
   const adapter = createServerAdapter({
     fetchImpl: async () => ({ ok: true, json: async () => ({ data: [{ ...model, supported_parameters: ["tools"] }] }) }),

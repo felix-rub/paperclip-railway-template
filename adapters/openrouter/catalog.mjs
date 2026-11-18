@@ -1,4 +1,6 @@
 const MODELS_URL = "https://openrouter.ai/api/v1/models";
+const FREE_ROUTER = "openrouter/free";
+const FREE_ROUTER_OUTPUT_CAP = 4096;
 const LOW_COST_PICKS = [
   "anthropic/claude-haiku-5.5", "minimax/minimax-m3.1-flash", "deepseek/deepseek-v3.2",
   "qwen/qwen3-coder", "openai/gpt-5-mini",
@@ -14,7 +16,9 @@ function pricePerMillion(value, name) {
 
 export function toRuntimeModel(entry) {
   const contextWindow = entry.context_length;
-  const maxTokens = entry.top_provider?.max_completion_tokens;
+  const reportedMaxTokens = entry.top_provider?.max_completion_tokens;
+  // The free router chooses a model per request and has no fixed completion limit.
+  const maxTokens = reportedMaxTokens ?? (entry.id === FREE_ROUTER ? FREE_ROUTER_OUTPUT_CAP : undefined);
   if (!Number.isSafeInteger(contextWindow) || contextWindow <= 0 ||
       !Number.isSafeInteger(maxTokens) || maxTokens <= 0) {
     throw new Error("OpenRouter did not report valid context/output limits for the selected model.");
@@ -72,7 +76,7 @@ export function createCatalog(fetchImpl = fetch) {
       const rank = id => LOW_COST_PICKS.includes(id) ? LOW_COST_PICKS.indexOf(id) : LOW_COST_PICKS.length;
       return (await entries(refresh)).map(({ id, name }) => ({
         id,
-        label: `${LOW_COST_PICKS.includes(id) ? "Low-cost pick: " : ""}${name || id}${id.endsWith(":free") ? " (free; rate limits apply)" : ""}`,
+        label: `${LOW_COST_PICKS.includes(id) ? "Low-cost pick: " : ""}${name || id}${id.endsWith(":free") || id === FREE_ROUTER ? " (free; rate limits apply)" : ""}`,
       })).sort((a, b) => rank(a.id) - rank(b.id) || a.label.localeCompare(b.label));
     },
     async resolve(model) {
