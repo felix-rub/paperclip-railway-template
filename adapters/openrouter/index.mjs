@@ -36,7 +36,7 @@ OpenCode, Codex and Claude Code are not used by this adapter.
 Use the environment editor for secrets; this external adapter does not impersonate
 a built-in adapter to bypass managed AI-connection compatibility checks.
 Do not bind a managed AI account to this adapter; use OPENROUTER_API_KEY instead.
-Other adapters and existing agents are unchanged.
+Other adapter types and their agents are unchanged.
 `;
 
 function errorText(error) {
@@ -61,7 +61,7 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
   async function prepareConfig(config) {
     if ((Array.isArray(config.extraArgs) && config.extraArgs.length) ||
         (Array.isArray(config.args) && config.args.length)) {
-      throw new Error("OpenRouter does not accept extra CLI arguments; configure model and thinking through the adapter fields.");
+      throw new Error("OpenRouter does not accept extra CLI arguments; free routing is managed by the server.");
     }
     const env = prepareEnvironment(config);
     const model = await catalog.resolve(FREE_MODEL);
