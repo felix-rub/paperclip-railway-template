@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node scripts/start.mjs",
     "build": "node scripts/build-openrouter-adapter.mjs",
-    "test": "node --test scripts/start.test.mjs scripts/openrouter-adapter.test.mjs adapters/openrouter/adapter.test.mjs"
+    "test": "node --test scripts/start.test.mjs scripts/openrouter-adapter.test.mjs scripts/openrouter-recovery.test.mjs adapters/openrouter/adapter.test.mjs"
   },
   "dependencies": {
     "paperclipai": "latest",

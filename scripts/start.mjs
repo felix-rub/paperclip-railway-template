@@ -26,6 +26,7 @@ import { homedir } from "os";
 import { patchBundledZod } from "./patch-bundled-zod.mjs";
 import { registerOpenRouterAdapter } from "./openrouter-adapter.mjs";
 import { attachUpgradeProxy } from "./proxy-upgrade.mjs";
+import { enforceOpenRouterRecovery } from "./openrouter-recovery.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -876,6 +877,7 @@ if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.ur
   registerOpenRouterAdapter();
   patchBundledZod();
   enforceAgentRetryPolicy();
+  enforceOpenRouterRecovery();
   enforceGeminiAcpModelCompatibility();
   if (shouldSeedGeminiConfig) {
     seedGeminiConfig();

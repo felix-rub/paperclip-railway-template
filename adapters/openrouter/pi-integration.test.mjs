@@ -9,10 +9,10 @@ import * as runtime from "@paperclipai/adapter-pi-local/server";
 import { createServerAdapter } from "./index.mjs";
 
 const model = {
-  id: "anthropic/claude-haiku-5.5", context_length: 128_000,
+  id: "openrouter/free", context_length: 128_000,
   top_provider: { max_completion_tokens: 8192 },
   architecture: { input_modalities: ["text"], output_modalities: ["text"] },
-  pricing: { prompt: "0.000001", completion: "0.000002" }, supported_parameters: ["tools"],
+  pricing: { prompt: "0", completion: "0" }, supported_parameters: ["tools"],
 };
 const call = (name, args) => ({ function: { name, arguments: JSON.stringify(args) }, type: "function" });
 
@@ -25,6 +25,7 @@ test("Pi executes scoped issue tools, rejects failed checks, and aborts loops", 
   const requests = [];
   let step = 0;
   let sequence = [];
+  let failureStatus;
   const server = createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -40,6 +41,11 @@ test("Pi executes scoped issue tools, rejects failed checks, and aborts loops", 
       return;
     }
     requests.push(JSON.parse(body));
+    if (failureStatus) {
+      res.writeHead(failureStatus, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: { code: failureStatus, message: "Free quota exhausted (synthetic fixture)." } }));
+      return;
+    }
     const tool = sequence[step++];
     const common = { id: `test-${step}`, object: "chat.completion.chunk", created: 1, model: model.id };
     const chunks = [
@@ -67,14 +73,14 @@ test("Pi executes scoped issue tools, rejects failed checks, and aborts loops", 
         return runtime.execute(ctx);
       } },
     });
-    async function run(verificationCommand, calls) {
+    async function run(verificationCommand, calls, overrides = {}) {
       sequence = calls;
       step = 0;
       return adapter.execute({
         runId: randomUUID(), agent: { id: randomUUID(), companyId: randomUUID(), name: "Fixture" },
         runtime: {}, context: { taskId: issueId }, authToken: "fixture-token",
         config: { profile: "compact", verificationCommand, cwd, model: model.id, timeoutSec: 20,
-          env: { OPENROUTER_API_KEY: "fixture-key" } },
+          env: { OPENROUTER_API_KEY: "fixture-key" }, ...overrides },
         onLog: async () => {},
       });
     }
@@ -86,7 +92,9 @@ test("Pi executes scoped issue tools, rejects failed checks, and aborts loops", 
     assert.equal(ok.exitCode, 0, `${ok.errorMessage}; ${ok.resultJson?.stderr}; ${ok.resultJson?.stdout?.split("\n").filter(line => line.includes('"type":"tool_execution_end"')).join("\n")}`);
     assert.equal(step, 3);
     assert.deepEqual(writes, [{ status: "done", comment: "Check passed." }]);
-    assert.match(JSON.stringify(requests[0]), /"cache_control":/);
+    assert.equal(requests[0].model, "openrouter/free");
+    assert.equal(requests[0].models, undefined);
+    assert.deepEqual(requests[0].provider.max_price, { prompt: 0, completion: 0 });
     const failed = await run("exit 7", [getTask, bash("exit 7"), done, blocked]);
     assert.equal(failed.exitCode, 0, failed.errorMessage);
     assert.deepEqual(writes.map(write => write.status), ["done", "blocked"]);
@@ -95,6 +103,18 @@ test("Pi executes scoped issue tools, rejects failed checks, and aborts loops", 
     assert.equal(loop.errorCode, "openrouter_tool_loop", loop.errorMessage);
     assert.equal(step, 3);
     assert.equal(writes.length, 2);
+    const standard = await run("", [], {
+      profile: "standard", model: "openai/paid", fallbackModels: "anthropic/paid", escalationModel: "example/paid",
+    });
+    assert.equal(standard.exitCode, 0, standard.errorMessage);
+    assert.equal(requests.at(-1).model, "openrouter/free");
+    assert.equal(requests.at(-1).models, undefined);
+    assert.deepEqual(requests.at(-1).provider.max_price, { prompt: 0, completion: 0 });
+    failureStatus = 429;
+    const before = requests.length;
+    const quota = await run("exit 7", []);
+    assert.notEqual(quota.exitCode, 0);
+    assert.equal(requests.length - before, 1, "Quota failure must return to the durable hourly scheduler, not retry immediately.");
   } finally {
     if (oldUrl === undefined) delete process.env.PAPERCLIP_API_URL;
     else process.env.PAPERCLIP_API_URL = oldUrl;

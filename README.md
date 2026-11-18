@@ -14,16 +14,17 @@ Railway doesn't provide shell access during deployment, so the normal `pnpm pape
 
 This wrapper bundles an external **OpenRouter** adapter (`openrouter`). It is
 registered automatically under **Settings > Adapters** and is selectable when
-creating or configuring an agent. Existing agents are not migrated.
+creating or configuring an agent. Other adapter types are unchanged.
 
 1. Select **OpenRouter** as the adapter.
-2. Choose a tool-capable model from the live OpenRouter catalog, or enter its
-   OpenRouter slug (for example `anthropic/claude-sonnet-4.5`).
+2. The model is always **openrouter/free**, enforced server-side for existing and
+   future agents, even if an old configuration names a paid model or fallback.
 3. Store your key in **Settings > Secrets**. In the agent environment editor,
    add `OPENROUTER_API_KEY` as a reference to that secret. A server-level
    `OPENROUTER_API_KEY` also works, but is shared by agents on the instance.
-4. Leave thinking off unless the selected model supports it. Run the environment
-   test, then a small task. Both can spend OpenRouter credits.
+4. Run the environment test, then a small task. Both use the free router.
+   Paid fallback and escalation are disabled; every request also has a zero
+   prompt/completion price ceiling. Thinking is off for router compatibility.
 
 Do not paste a key into the model, prompt, or an ordinary configuration text field.
 Managed AI-account bindings are not supported by this external adapter; use the
@@ -33,11 +34,38 @@ OpenRouter handles inference directly. Pi's pinned coding-agent runtime supplies
 the tool loop, workspace tools, instructions, skills, streaming, session resume,
 and usage accounting. This does **not** invoke OpenCode, Codex, or Claude Code.
 The wrapper forwards authenticated WebSocket upgrades for live run updates.
-Catalog metadata supplies context/output limits and estimated token prices; actual
-OpenRouter billing may differ with provider routing and tiered pricing.
+Catalog metadata supplies context/output limits. Nonzero free-router pricing
+fails closed rather than allowing paid inference.
 For `openrouter/free`, OpenRouter picks a free model per request and does not
 publish a fixed completion limit. The adapter caps requests at 4,096 output
 tokens (or the lower agent setting); rate limits and routed model limits still apply.
+
+### Permanent hourly recovery
+
+Every failed, timed-out or interrupted OpenRouter run gets a database-backed
+`scheduled_retry`, due one hour after its persisted failure timestamp. There is
+no finite attempt budget or exponential backoff. Free quota exhaustion, router
+unavailability, configuration errors and compact guard stops all wait for the next
+hour; no paid model is substituted. Pi's immediate provider/agent retries are
+disabled for this adapter.
+New-agent verification failures follow the same hourly interval without dropping
+accepted work; readiness is never fabricated while the provider is unavailable.
+
+The normal scheduler promotes due retries automatically, so execution resumes on
+the next scheduler tick after the hour, not at an exact wall-clock second.
+Successor runs retain the task, authorization scope and resumable session.
+Database transactions deduplicate simultaneous schedulers, and waiting work
+survives restarts/deployments. A recurring sweep also recovers the latest
+unsuperseded failure of existing tasks and agent-only runs, including tasks
+automatically blocked by the system. Previously scheduled retries are normalized
+to the same one-hour rule.
+
+Completed/cancelled tasks, superseded runs, human-blocked tasks, deliberately
+stopped runs, manually paused agents/session goals, approvals, dependencies and
+budget/authorization gates are not overridden. Repair permanent configuration
+errors when reported; hourly attempts continue while work remains eligible.
+An upstream change that no longer matches the boot-time compatibility patch
+stops startup explicitly rather than silently reverting to short/bounded retries.
 
 ### Compact mode for low-cost models
 
@@ -53,18 +81,12 @@ agents, not a sandbox or proof that an inadequate verifier checked the task.
 Compact stops the third identical tool call and defaults to 30 calls,
 80,000 reported input tokens per attempt, and 600 seconds. The input budget is
 checked after each response, so a request already sent can overshoot. Guard
-stops do not enter the wrapper's automatic continuation retry loop.
+stops retain their per-attempt bounds and resume in the hourly recovery lane.
 Paperclip's `timeoutSec: 0` sentinel uses the bounded profile default (Standard:
 300 seconds, Compact: 600 seconds), rather than disabling the adapter timeout.
 
-Optional **Fallback models** are ordered OpenRouter slugs, attempted by OpenRouter
-when a request can't be served. **Escalation model** is a separate, one-time
-attempt for a compact run that loops or exits unfinished before attempting
-workspace changes or issue writes. Both are off by default and can incur charges.
-Start with the catalog's low-cost picks; free variants are rate-limited.
-Pi sends Anthropic-compatible ephemeral cache markers for OpenRouter Anthropic
-models; providers with automatic prefix caching may also report cached tokens.
-Cache hits and discounts depend on the routed provider and prompt length.
+Saved fallback/escalation fields are ignored. Caching depends on the free model
+chosen by OpenRouter; cache hits are not guaranteed.
 
 Sessions persist under `/paperclip/openrouter/sessions`. On first boot, the wrapper
 links Pi's session directory there. It refuses to overwrite an existing Pi session
@@ -74,6 +96,10 @@ For local development, run `npm install`, `npm run build`, then `npm test`.
 In a disposable Linux environment with `node_modules/.bin` on `PATH`, run
 `OPENROUTER_PI_INTEGRATION=1 node --test adapters/openrouter/pi-integration.test.mjs`
 to exercise actual Pi against local fake OpenRouter and Paperclip endpoints.
+For durable queue tests, point `OPENROUTER_TEST_DATABASE_URL` at a disposable
+local PostgreSQL database named `openrouter_retry_test`, then run
+`node --test scripts/openrouter-recovery.integration.test.mjs`. It applies
+Paperclip migrations and creates synthetic fixtures; never use production data.
 The generated browser transcript parser is bundled from Paperclip's Pi adapter.
 The CLI is pinned to patched Pi `0.78.1`; runtime upgrades must preserve tool
 execution and session resume.
@@ -201,7 +227,7 @@ Once Paperclip is running, this wrapper is transparent — it proxies public tra
 → This is an OpenCode regression affecting Gemini BYOK requests in OpenCode 1.18.21 and newer. This template uses OpenCode 1.18.20 until the upstream fix is released; redeploy so Railway installs that version.
 
 **An agent run fails**
-→ The wrapper retries failed agent runs indefinitely, every 60 seconds. This includes adapter and provider failures such as the OpenCode/Gemini error above. A retry creates a new run using the same agent and task, so correct permanent configuration problems before leaving the service running.
+→ OpenRouter uses persistent unlimited hourly retries (see above). The existing 60-second recovery policy for other adapters is unchanged. A retry creates a new run using the same agent and task; correct permanent configuration problems when reported.
 
 **Gemini adapter fails with `Command not found in PATH: "gemini"`**
 → Ensure the service is running the latest image so `@google/gemini-cli` is installed, then redeploy/restart.

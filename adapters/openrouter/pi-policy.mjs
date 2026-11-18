@@ -2,11 +2,11 @@ import { writeFileSync } from "node:fs";
 import { COMPACT_PROMPT, createGuard, createIssueTools, routeRequest } from "./policy.mjs";
 
 export default function policyExtension(pi) {
-  const policy = JSON.parse(process.env.PAPERCLIP_OPENROUTER_POLICY);
+  const policy = JSON.parse(process.env.PAPERCLIP_OPENROUTER_POLICY || '{"compact":false}');
   const state = {};
   const persist = () => writeFileSync(policy.outcome, JSON.stringify(state), { mode: 0o600 });
   const guard = createGuard(policy, state);
-  pi.on("before_provider_request", ({ payload }) => routeRequest(payload, policy.fallbackModels));
+  pi.on("before_provider_request", ({ payload }) => routeRequest(payload));
   if (!policy.compact) return;
 
   const issue = createIssueTools({

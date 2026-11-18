@@ -14,7 +14,8 @@ const model = {
   supported_parameters: ["tools", "reasoning"],
 };
 const fakeKey = "test-only-not-a-real-credential";
-const fetchCatalog = async () => ({ ok: true, json: async () => ({ data: [model] }) });
+const freeModel = { ...model, id: "openrouter/free", pricing: { prompt: "0", completion: "0" } };
+const fetchCatalog = async () => ({ ok: true, json: async () => ({ data: [model, freeModel] }) });
 
 test("compact completion requires the exact successful check after changes", async () => {
   const state = {};
@@ -61,13 +62,18 @@ test("compact guard blocks the third duplicate and counts cached input against b
   assert.equal(budgetState.stop, "openrouter_input_budget");
 });
 
-test("routing requests an ordered fallback and preserves provider-specific cache markers", () => {
+test("routing rejects paid models and fallbacks even in stale request payloads", () => {
   const payload = {
     model: "anthropic/claude-haiku-5.5",
+    models: ["openai/paid"], route: "fallback",
+    provider: { max_price: { prompt: 10, completion: 10 } },
     messages: [{ role: "system", content: [{ type: "text", text: "prefix", cache_control: { type: "ephemeral" } }] }],
   };
   const routed = routeRequest(payload, ["example/tool-model"]);
-  assert.deepEqual(routed.models, [payload.model, "example/tool-model"]);
+  assert.equal(routed.model, "openrouter/free");
+  assert.equal(routed.models, undefined);
+  assert.equal(routed.route, undefined);
+  assert.deepEqual(routed.provider.max_price, { prompt: 0, completion: 0 });
   assert.equal(routed.provider.require_parameters, true);
   assert.deepEqual(routed.messages, payload.messages);
 });
@@ -81,14 +87,19 @@ test("adapter routes exclusively to OpenRouter and preserves lifecycle, session 
     async execute(ctx) {
       assert.equal(ctx.signal, controller.signal);
       assert.equal(ctx.config.command, "pi");
-      assert.equal(ctx.config.model, "openrouter/example/tool-model");
+      assert.equal(ctx.config.model, "openrouter/openrouter/free");
+      assert.equal(ctx.config.thinking, "off");
+      assert.equal(ctx.config.fallbackModels, "");
+      assert.equal(ctx.config.escalationModel, "");
+      assert.ok(ctx.config.extraArgs.includes("--extension"));
+      assert.equal(ctx.config.env.PAPERCLIP_OPENROUTER_FREE_ONLY, "1");
       assert.equal(ctx.config.env.OPENROUTER_API_KEY, fakeKey);
       const providers = JSON.parse(ctx.config.env.PAPERCLIP_PI_PROVIDERS);
       assert.deepEqual(Object.keys(providers), ["openrouter"]);
       assert.equal(providers.openrouter.baseUrl, "https://openrouter.ai/api/v1");
       assert.equal(providers.openrouter.apiKey, "OPENROUTER_API_KEY");
-      assert.equal(providers.openrouter.models[0].cost.input, 1);
-      assert.equal(providers.openrouter.models[0].cost.output, 2);
+      assert.equal(providers.openrouter.models[0].cost.input, 0);
+      assert.equal(providers.openrouter.models[0].cost.output, 0);
       assert.equal(providers.openrouter.models[0].maxTokens, 256);
       assert.equal(providers.openrouter.models[0].contextWindow, 128_000);
       assert.equal(ctx.config.timeoutSec, 300);
@@ -103,7 +114,8 @@ test("adapter routes exclusively to OpenRouter and preserves lifecycle, session 
   assert.equal(adapter.type, "openrouter");
   assert.equal(adapter.sessionCodec, runtime.sessionCodec);
   assert.equal(await adapter.execute({
-    config: { model: model.id, maxOutputTokens: 256, env: { OPENROUTER_API_KEY: fakeKey } },
+    config: { model: model.id, thinking: "high", fallbackModels: "openai/paid", escalationModel: "anthropic/paid",
+      maxOutputTokens: 256, env: { OPENROUTER_API_KEY: fakeKey } },
     signal: controller.signal,
     onMeta: async value => { metadata = value; },
     onUsage: async value => { receivedUsage = value; },
@@ -186,12 +198,12 @@ test("OpenRouter's free router runs with null completion limits and respects a l
   assert.throws(() => toRuntimeModel({ ...free, pricing: { prompt: "-1", completion: "-1" } }), /invalid input pricing/);
 });
 
-test("incompatible reasoning and provider-overriding arguments never execute", async () => {
+test("provider-overriding arguments and invalid timeouts never execute", async () => {
   const adapter = createServerAdapter({
-    fetchImpl: async () => ({ ok: true, json: async () => ({ data: [{ ...model, supported_parameters: ["tools"] }] }) }),
+    fetchImpl: fetchCatalog,
     runtime: { execute: () => assert.fail("must not run") },
   });
-  for (const overrides of [{ thinking: "high" }, { extraArgs: ["--provider", "openai"] }, { timeoutSec: -1 }, { timeoutSec: "0" }]) {
+  for (const overrides of [{ extraArgs: ["--provider", "openai"] }, { timeoutSec: -1 }, { timeoutSec: "0" }]) {
     const result = await adapter.execute({
       config: { model: model.id, env: { OPENROUTER_API_KEY: fakeKey }, ...overrides },
       onLog: async () => {},
@@ -229,11 +241,11 @@ test("environment probe reports the OpenRouter adapter identity and prepared pro
     runtime: {
       async execute(ctx) {
         tested = true;
-        assert.equal(ctx.config.model, `openrouter/${model.id}`);
+        assert.equal(ctx.config.model, "openrouter/openrouter/free");
         const providers = JSON.parse(ctx.config.env.PAPERCLIP_PI_PROVIDERS);
         assert.equal(providers.openrouter.models[0].maxTokens, 256);
         assert.equal(ctx.config.timeoutSec, 60);
-        assert.deepEqual(ctx.config.extraArgs, ["--tools", "read", "--no-session"]);
+        assert.deepEqual(ctx.config.extraArgs.slice(0, 5), ["--tools", "read", "--no-session", "--no-extensions", "--extension"]);
         return { exitCode: 0, summary };
       },
     },
@@ -266,6 +278,20 @@ test("environment probe reports provider failures without leaking credentials", 
 test("configuration schema lists OpenRouter models without a plaintext key field", async () => {
   const adapter = createServerAdapter({ fetchImpl: fetchCatalog });
   const schema = await adapter.getConfigSchema();
-  assert.deepEqual(schema.fields.find(field => field.key === "model").options, [{ value: model.id, label: model.name }]);
+  assert.deepEqual(schema.fields.find(field => field.key === "model").options, [{ value: "openrouter/free", label: "OpenRouter Free (enforced)" }]);
+  assert.deepEqual((await adapter.listModels()).map(model => model.id), ["openrouter/free"]);
+  assert.equal(schema.fields.some(field => ["fallbackModels", "escalationModel"].includes(field.key)), false);
   assert.equal(schema.fields.some(field => /^(?:apiKey|key|token|password|secret|OPENROUTER_API_KEY)$/i.test(field.key)), false);
+});
+
+test("free router pricing changes fail closed without invoking inference", async () => {
+  const adapter = createServerAdapter({
+    fetchImpl: async () => Response.json({ data: [{ ...freeModel, pricing: model.pricing }] }),
+    runtime: { execute: () => assert.fail("paid inference must never execute") },
+  });
+  const result = await adapter.execute({
+    config: { env: { OPENROUTER_API_KEY: fakeKey } }, onLog: async () => {},
+  });
+  assert.equal(result.exitCode, 1);
+  assert.match(result.errorMessage, /refusing paid inference/);
 });

@@ -101,11 +101,12 @@ export function createGuard({ maxToolCalls, maxRunInputTokens, verificationComma
   };
 }
 
-export function routeRequest(payload, fallbackModels) {
-  if (!payload || !Array.isArray(payload.messages)) return payload;
+export function routeRequest(payload) {
+  if (!payload || !Array.isArray(payload.messages)) throw new Error("Invalid OpenRouter request payload.");
+  const { models, route, ...request } = payload;
   return {
-    ...payload,
-    provider: { ...payload.provider, require_parameters: true },
-    ...(fallbackModels.length ? { models: [payload.model, ...fallbackModels] } : {}),
+    ...request,
+    model: "openrouter/free",
+    provider: { ...payload.provider, require_parameters: true, max_price: { prompt: 0, completion: 0 } },
   };
 }
