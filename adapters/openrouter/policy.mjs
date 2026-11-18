@@ -103,10 +103,17 @@ export function createGuard({ maxToolCalls, maxRunInputTokens, verificationComma
 
 export function routeRequest(payload) {
   if (!payload || !Array.isArray(payload.messages)) throw new Error("Invalid OpenRouter request payload.");
-  const { models, route, ...request } = payload;
+  const { models, route, store: _unusedStore, provider: rawProvider, ...request } = payload;
+  const { require_parameters: _unusedRequireParameters, ...provider } = rawProvider ?? {};
+  if (request.reasoning?.effort === "none" || request.reasoning?.enabled === false) {
+    delete request.reasoning;
+  }
+  if (request.reasoning_effort === "none") {
+    delete request.reasoning_effort;
+  }
   return {
     ...request,
     model: "openrouter/free",
-    provider: { ...payload.provider, require_parameters: true, max_price: { prompt: 0, completion: 0 } },
+    provider: { ...provider, max_price: { prompt: 0, completion: 0 } },
   };
 }

@@ -25,6 +25,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
     completion: readFileSync(new URL(`${server}heartbeat/run-completion.js`, import.meta.url), "utf8"),
     recovery: readFileSync(new URL(`${server}recovery/service.js`, import.meta.url), "utf8"),
     pi: readFileSync(new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/runtime-config.js", import.meta.url), "utf8"),
+    piExecute: readFileSync(new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/execute.js", import.meta.url), "utf8"),
     conversation: readFileSync(new URL(`${server}conversation-continuation.js`, import.meta.url), "utf8"),
     queue: readFileSync(new URL(`${server}heartbeat/queue.js`, import.meta.url), "utf8"),
     lifecycle: readFileSync(new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url), "utf8"),
@@ -32,9 +33,13 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   const patched = patchOpenRouterSources(sources);
   assert.deepEqual(patchOpenRouterSources(patched), patched);
   assert.match(patched.retries, /opts = openRouterRetryOptions/);
+  assert.match(patched.retries, /openRouterPrevAdapter !== "openrouter"/);
   assert.match(patched.completion, /"failed", "timed_out", "interrupted"/);
   assert.match(patched.recovery, /await reconcileOpenRouterRetries/);
+  assert.match(patched.recovery, /runUsedConversationAdapter/);
   assert.match(patched.pi, /retry: \{ enabled: false, maxRetries: 0, provider: \{ maxRetries: 0 \} \}/);
+  assert.match(patched.piExecute, /localSystemPromptPath/);
+  assert.match(patched.piExecute, /stdin: !executionTargetIsRemote && userPrompt\.trim\(\)\.length > 0/);
   const changed = { ...sources, retries: "unexpected upstream implementation" };
   assert.throws(() => patchOpenRouterSources(changed), /no longer matches upstream/);
   assert.equal(changed.retries, "unexpected upstream implementation");

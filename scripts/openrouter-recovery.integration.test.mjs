@@ -53,21 +53,24 @@ test("durable hourly recovery survives restarts, exhausted budgets and concurren
     };
   }
   async function fixture({ issueStatus = "in_progress", agentStatus = "active", adapterType = "openrouter",
-    runStatus = "failed", scopeKind = "issue", blockActor, code = "adapter_failed" } = {}) {
+    dispatchAdapterType = adapterType, companyStatus = "active", runStatus = "failed", scopeKind = "issue",
+    legacyIssueInSnapshotOnly = false, blockActor, code = "adapter_failed" } = {}) {
     const companyId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Hourly retry fixture", issuePrefix: `R${companyId.slice(0, 7)}` });
+    await db.insert(companies).values({
+      id: companyId, name: "Hourly retry fixture", status: companyStatus, issuePrefix: `R${companyId.slice(0, 7)}`,
+    });
     const [agent] = await db.insert(agents).values({
       companyId, name: "Fixture", adapterType, status: agentStatus,
       adapterConfig: { model: "openai/paid" },
     }).returning();
-    const [issue] = scopeKind === "issue" ? await db.insert(issues).values({
+    const [issue] = (scopeKind === "issue" || legacyIssueInSnapshotOnly) ? await db.insert(issues).values({
       companyId, title: "Retry fixture", status: issueStatus, assigneeAgentId: agent.id,
     }).returning() : [];
     const [run] = await db.insert(heartbeatRuns).values({
-      companyId, agentId: agent.id, scopeKind, issueId: issue?.id,
+      companyId, agentId: agent.id, scopeKind, issueId: legacyIssueInSnapshotOnly ? null : issue?.id,
       status: runStatus, errorCode: code, finishedAt: now, createdAt: new Date(+now - 1000),
       scheduledRetryAttempt: 1_000_000, scheduledRetryReason: "transient_failure",
-      runnerProfileJson: { adapterDispatch: { adapterType } },
+      runnerProfileJson: dispatchAdapterType === null ? {} : { adapterDispatch: { adapterType: dispatchAdapterType } },
       resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
       contextSnapshot: issue ? { issueId: issue.id, taskId: issue.id } : {},
     }).returning();
@@ -122,6 +125,12 @@ test("durable hourly recovery survives restarts, exhausted budgets and concurren
 
     const standalone = await fixture({ scopeKind: "company", agentStatus: "error", code: "configuration_incomplete" });
     const blocked = await fixture({ issueStatus: "blocked", blockActor: "system" });
+    const migratedFromOpencode = await fixture({ dispatchAdapterType: "opencode_local" });
+    const migratedLegacySnapshot = await fixture({
+      scopeKind: "company", legacyIssueInSnapshotOnly: true, dispatchAdapterType: "codex_local",
+    });
+    const preDispatchBootstrap = await fixture({ dispatchAdapterType: null });
+    const archivedCompany = await fixture({ companyStatus: "archived", dispatchAdapterType: "opencode_local" });
     const stopped = await fixture({ runStatus: "cancelled" });
     const paused = await fixture({ agentStatus: "paused" });
     const done = await fixture({ issueStatus: "done" });
@@ -137,7 +146,12 @@ test("durable hourly recovery survives restarts, exhausted budgets and concurren
     await reconcileOpenRouterRetries(db, factory(), sql, logger);
     assert.equal((await successors(standalone.run)).length, 1);
     assert.equal((await successors(blocked.run)).length, 1);
-    for (const f of [stopped, paused, done, cancelled, other, humanBlocked, superseded]) {
+    const [migratedRetry] = await successors(migratedFromOpencode.run);
+    assert.ok(migratedRetry);
+    assert.equal(migratedRetry.sessionIdBefore, null, "Cross-adapter migration must start a fresh Pi session.");
+    assert.equal((await successors(migratedLegacySnapshot.run)).length, 1);
+    assert.equal((await successors(preDispatchBootstrap.run)).length, 1);
+    for (const f of [archivedCompany, stopped, paused, done, cancelled, other, humanBlocked, superseded]) {
       assert.equal((await successors(f.run)).length, 0, `Unexpected retry: ${f.run.id}`);
     }
 

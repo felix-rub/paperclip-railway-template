@@ -94,8 +94,8 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
           openrouter: {
             baseUrl: "https://openrouter.ai/api/v1",
             api: "openai-completions",
-            apiKey: "OPENROUTER_API_KEY",
-            models: [model],
+            apiKey: "{env:OPENROUTER_API_KEY}",
+            models: [model, ...(model.id === FREE_MODEL ? [{ ...model, id: "free" }] : [])],
           },
         }),
       },

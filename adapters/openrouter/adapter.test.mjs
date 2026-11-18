@@ -62,20 +62,27 @@ test("compact guard blocks the third duplicate and counts cached input against b
   assert.equal(budgetState.stop, "openrouter_input_budget");
 });
 
-test("routing rejects paid models and fallbacks even in stale request payloads", () => {
+test("routing rejects paid models, require_parameters, and disabled reasoning flags on mandatory-reasoning free endpoints", () => {
   const payload = {
     model: "anthropic/claude-haiku-5.5",
-    models: ["openai/paid"], route: "fallback",
-    provider: { max_price: { prompt: 10, completion: 10 } },
+    models: ["openai/paid"], route: "fallback", store: false,
+    reasoning: { effort: "none" },
+    reasoning_effort: "none",
+    provider: { require_parameters: true, allow_fallbacks: true, max_price: { prompt: 10, completion: 10 } },
     messages: [{ role: "system", content: [{ type: "text", text: "prefix", cache_control: { type: "ephemeral" } }] }],
   };
   const routed = routeRequest(payload, ["example/tool-model"]);
   assert.equal(routed.model, "openrouter/free");
   assert.equal(routed.models, undefined);
   assert.equal(routed.route, undefined);
+  assert.equal(routed.store, undefined);
+  assert.equal(routed.reasoning, undefined);
+  assert.equal(routed.reasoning_effort, undefined);
   assert.deepEqual(routed.provider.max_price, { prompt: 0, completion: 0 });
-  assert.equal(routed.provider.require_parameters, true);
+  assert.equal(routed.provider.require_parameters, undefined);
+  assert.equal(routed.provider.allow_fallbacks, true);
   assert.deepEqual(routed.messages, payload.messages);
+  assert.deepEqual(routeRequest({ messages: [], reasoning: { effort: "medium" } }).reasoning, { effort: "medium" });
 });
 
 test("adapter routes exclusively to OpenRouter and preserves lifecycle, session and usage hooks", async () => {
@@ -97,10 +104,20 @@ test("adapter routes exclusively to OpenRouter and preserves lifecycle, session 
       const providers = JSON.parse(ctx.config.env.PAPERCLIP_PI_PROVIDERS);
       assert.deepEqual(Object.keys(providers), ["openrouter"]);
       assert.equal(providers.openrouter.baseUrl, "https://openrouter.ai/api/v1");
-      assert.equal(providers.openrouter.apiKey, "OPENROUTER_API_KEY");
+      assert.equal(providers.openrouter.apiKey, "{env:OPENROUTER_API_KEY}");
+      assert.equal(providers.openrouter.models.length, 2);
+      assert.equal(providers.openrouter.models[0].id, "openrouter/free");
+      assert.equal(providers.openrouter.models[1].id, "free");
       assert.equal(providers.openrouter.models[0].cost.input, 0);
       assert.equal(providers.openrouter.models[0].cost.output, 0);
+      assert.equal(providers.openrouter.models[0].reasoning, true);
+      assert.deepEqual(providers.openrouter.models[0].compat, {
+        supportsStore: false,
+        supportsDeveloperRole: false,
+        thinkingFormat: "openrouter",
+      });
       assert.equal(providers.openrouter.models[0].maxTokens, 256);
+      assert.equal(providers.openrouter.models[1].maxTokens, 256);
       assert.equal(providers.openrouter.models[0].contextWindow, 128_000);
       assert.equal(ctx.config.timeoutSec, 300);
       await ctx.onMeta({ adapterType: "pi_local", command: "pi" });

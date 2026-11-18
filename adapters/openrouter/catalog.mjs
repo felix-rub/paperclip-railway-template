@@ -28,6 +28,11 @@ export function toRuntimeModel(entry) {
     name: entry.name || entry.id,
     reasoning: entry.supported_parameters.includes("reasoning") ||
       entry.supported_parameters.includes("reasoning_effort"),
+    compat: {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      thinkingFormat: "openrouter",
+    },
     input: entry.architecture.input_modalities.includes("image") ? ["text", "image"] : ["text"],
     cost: {
       input: pricePerMillion(entry.pricing?.prompt, "input"),

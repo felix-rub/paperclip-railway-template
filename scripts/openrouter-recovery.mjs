@@ -55,30 +55,52 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
   const result = await db.execute(sql`
     select r.id
     from heartbeat_runs r
+    join companies c on c.id = r.company_id and c.status = 'active'
     join agents a on a.id = r.agent_id and a.company_id = r.company_id
-    left join issues i on i.id = r.issue_id and i.company_id = r.company_id
+    left join issues i on i.company_id = r.company_id
+      and i.id::text = nullif(coalesce(r.issue_id::text, r.context_snapshot ->> 'issueId'), '')
     where a.adapter_type = 'openrouter'
       and a.status not in ('paused', 'terminated', 'pending_approval')
       and r.status in ('failed', 'timed_out', 'interrupted')
       and coalesce(r.runtime_mode, 'local') <> 'native'
-      and (r.runner_profile_json -> 'adapterDispatch' ->> 'adapterType' = 'openrouter'
+      and coalesce(r.result_json ->> 'workspaceRestoreFailure', '') <> 'restore_unsafe_archive'
+      and coalesce(r.result_json -> 'workspaceRestoreRecovery' ->> 'schema', '') <>
+        'paperclip.workspace-restore-recovery.v1'
+      and (
+        coalesce(r.runner_profile_json -> 'adapterDispatch' ->> 'adapterType', '') in
+          ('claude_local', 'codex_local', 'cursor', 'gemini_local', 'opencode_local',
+           'pi_local', 'grok_local', 'kimi_local', 'hermes_local', 'openrouter')
+        or coalesce(r.result_json ->> 'conversationContinuation', '') = 'continue_conversation_v1'
         or exists (select 1 from heartbeat_run_events e
           where e.run_id = r.id and e.company_id = r.company_id
-            and e.event_type = 'adapter.invoke' and e.payload ->> 'adapterType' = 'openrouter'))
+            and e.event_type = 'adapter.invoke'
+            and coalesce(e.payload ->> 'adapterType', '') in
+              ('claude_local', 'codex_local', 'cursor', 'gemini_local', 'opencode_local',
+               'pi_local', 'grok_local', 'kimi_local', 'hermes_local', 'openrouter'))
+        or (
+          r.runner_profile_json -> 'adapterDispatch' ->> 'adapterType' is null
+          and coalesce(r.result_json -> 'executionRecovery' ->> 'providerWorkStarted', '') = 'false'
+          and not exists (select 1 from heartbeat_run_events e
+            where e.run_id = r.id and e.company_id = r.company_id and e.event_type = 'adapter.invoke')
+        )
+      )
       and coalesce(r.error_code, '') not in
         ('operator_interrupted', 'agent_paused', 'chat_control_stop', 'chat_control_unresolved')
-      and (r.scope_kind = 'company' or (
-        i.id is not null and i.hidden_at is null and i.assignee_user_id is null
-        and i.status in ('todo', 'in_progress', 'in_review', 'blocked')
-        and (i.assignee_agent_id = a.id or i.status = 'in_review')
-        and (i.status <> 'blocked' or (
-          select l.actor_type = 'system'
-          from activity_log l
-          where l.company_id = i.company_id and l.entity_type = 'issue'
-            and l.entity_id = i.id::text and l.details ->> 'status' is not null
-          order by l.created_at desc, l.id desc limit 1
-        ))
-      ))
+      and (
+        (nullif(coalesce(r.issue_id::text, r.context_snapshot ->> 'issueId'), '') is null and r.scope_kind = 'company')
+        or (
+          i.id is not null and i.hidden_at is null and i.assignee_user_id is null
+          and i.status in ('todo', 'in_progress', 'in_review', 'blocked')
+          and (i.assignee_agent_id = a.id or i.status = 'in_review')
+          and (i.status <> 'blocked' or (
+            select l.actor_type = 'system'
+            from activity_log l
+            where l.company_id = i.company_id and l.entity_type = 'issue'
+              and l.entity_id = i.id::text and l.details ->> 'status' is not null
+            order by l.created_at desc, l.id desc limit 1
+          ))
+        )
+      )
       and not exists (
         select 1 from heartbeat_runs successor
         where successor.company_id = r.company_id and successor.retry_of_run_id = r.id
@@ -86,10 +108,9 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
       and not exists (
         select 1 from heartbeat_runs newer
         where newer.company_id = r.company_id
-          and newer.scope_kind = r.scope_kind
           and (
-            (r.scope_kind = 'issue' and newer.issue_id = r.issue_id)
-            or (r.scope_kind = 'company' and newer.agent_id = r.agent_id
+            (i.id is not null and nullif(coalesce(newer.issue_id::text, newer.context_snapshot ->> 'issueId'), '') = i.id::text)
+            or (i.id is null and newer.scope_kind = 'company' and newer.agent_id = r.agent_id
               and coalesce(newer.context_snapshot ->> 'taskKey', '') =
                   coalesce(r.context_snapshot ->> 'taskKey', ''))
           )
@@ -98,8 +119,15 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
       and not exists (
         select 1 from agent_task_sessions s
         where s.company_id = r.company_id and s.agent_id = r.agent_id
-          and s.task_key = coalesce(r.issue_id::text, r.context_snapshot ->> 'taskKey')
+          and s.task_key = coalesce(i.id::text, r.context_snapshot ->> 'taskKey')
           and s.goal_desired_state = 'paused'
+      )
+      and not exists (
+        select 1 from heartbeat_run_events suppressed
+        where suppressed.run_id = r.id and suppressed.company_id = r.company_id
+          and suppressed.event_type = 'lifecycle' and suppressed.level = 'warn'
+          and suppressed.payload -> 'scheduledRetryAttempt' is not null
+          and suppressed.created_at > now() - interval '1 hour'
       )
     order by r.created_at, r.id
     limit 200
@@ -132,11 +160,23 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
         opts = openRouterRetryOptions(run, agent, opts);`);
   output.retries = replaceOnce(output.retries,
     'import { CONVERSATION_CONTINUATION_POLICY, hasConversationContinuationPolicy, }',
-    'import { CONVERSATION_CONTINUATION_POLICY, hasConversationContinuationPolicy, historicalAdapterType, }');
+    'import { CONVERSATION_CONTINUATION_POLICY, hasConversationContinuationPolicy, historicalAdapterType, runUsedConversationAdapter, }');
   output.retries = replaceOnce(output.retries,
     '        const now = opts?.now ?? new Date();\n        const retryReason =',
-    `        if (agent.adapterType === "openrouter" && await historicalAdapterType(db, run) === "openrouter") {
-            run = { ...run, resultJson: { ...run.resultJson, conversationContinuation: CONVERSATION_CONTINUATION_POLICY } };
+    `        const openRouterPrevAdapter = agent.adapterType === "openrouter" ? await historicalAdapterType(db, run) : null;
+        if (agent.adapterType === "openrouter" &&
+            (openRouterPrevAdapter === "openrouter" ||
+                await runUsedConversationAdapter(db, run) ||
+                (openRouterPrevAdapter === null && run.resultJson?.executionRecovery?.providerWorkStarted === false))) {
+            if (run.resultJson?.conversationContinuation !== CONVERSATION_CONTINUATION_POLICY) {
+                const nextResultJson = { ...run.resultJson, conversationContinuation: CONVERSATION_CONTINUATION_POLICY };
+                run = { ...run, resultJson: nextResultJson };
+                if (run.runtimeMode !== "native") {
+                    await db.update(heartbeatRuns)
+                        .set({ resultJson: nextResultJson })
+                        .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId)));
+                }
+            }
         }
         const now = opts?.now ?? new Date();
         const retryReason =`);
@@ -152,12 +192,18 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
   output.retries = replaceOnce(output.retries,
     'const requiresIssueGate = isTransientWorkspaceGitScanCode(run.errorCode) ||',
     'const requiresIssueGate = agent.adapterType === "openrouter" || isTransientWorkspaceGitScanCode(run.errorCode) ||');
+  output.retries = replaceOnce(output.retries,
+    '        const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);',
+    '        const sessionBefore = agent.adapterType === "openrouter" && openRouterPrevAdapter !== "openrouter" ? null : await resolveSessionBeforeForWakeup(agent, taskKey);');
   output.completion = replaceOnce(output.completion,
     'if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {',
     'if (agent.adapterType === "openrouter" && ["failed", "timed_out", "interrupted"].includes(outcome)) {\n                await scheduleBoundedRetryForRun(livenessRun, agent);\n            }\n            else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {');
   output.completion = replaceOnce(output.completion,
     'await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)',
     'await (failedAgent.adapterType === "openrouter" || isTransientWorkspaceGitScanCode(livenessRun.errorCode)');
+  output.recovery = replaceOnce(output.recovery,
+    'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";',
+    'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";\nimport { runUsedConversationAdapter } from "../conversation-continuation.js";');
   output.recovery = replaceOnce(output.recovery,
     '    async function reconcileStrandedAssignedIssues(opts) {',
     '    async function reconcileStrandedAssignedIssues(opts) {\n        await reconcileOpenRouterRetries(db, deps, sql, logger);');
@@ -167,10 +213,13 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
   output.recovery = replaceOnce(output.recovery,
     '            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);',
     `            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
-            if (latestRun && ["failed", "timed_out", "interrupted"].includes(latestRun.status) &&
-                (await getAgent(latestRun.agentId))?.adapterType === "openrouter") {
-                // The persistent hourly lane owns failures; never escalate them
-                // or restart them via the generic 60-second continuation lane.
+            if (latestRun && latestRun.agentId === agentId &&
+                ["failed", "timed_out", "interrupted"].includes(latestRun.status) &&
+                (await getAgent(agentId))?.adapterType === "openrouter" &&
+                (await runUsedConversationAdapter(db, latestRun) ||
+                    latestRun.resultJson?.executionRecovery?.providerWorkStarted === false)) {
+                // The persistent hourly lane owns conversation/bootstrap failures; never
+                // escalate them or restart them via the generic 60-second continuation lane.
                 result.skipped += 1;
                 continue;
             }`);
@@ -181,6 +230,32 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
                 retry: { enabled: false, maxRetries: 0, provider: { maxRetries: 0 } }
             }), "utf8");
         }`);
+  output.piExecute = replaceOnce(output.piExecute,
+    '    let attributionExtension;',
+    '    let attributionExtension;\n    let localSystemPromptDir = null;');
+  output.piExecute = replaceOnce(output.piExecute,
+    '        const renderedSystemPromptExtension = renderTemplate(systemPromptExtension, templateData);',
+    `        const renderedSystemPromptExtension = renderTemplate(systemPromptExtension, templateData);
+        const localSystemPromptPath = !executionTargetIsRemote && renderedSystemPromptExtension.length > 0
+            ? await (async () => {
+                localSystemPromptDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-pi-system-prompt-"));
+                const targetPath = path.join(localSystemPromptDir, "system-prompt.md");
+                await fs.writeFile(targetPath, renderedSystemPromptExtension, "utf8");
+                return targetPath;
+            })()
+            : null;`);
+  output.piExecute = replaceOnce(output.piExecute,
+    '            args.push("--append-system-prompt", renderedSystemPromptExtension);',
+    '            args.push("--append-system-prompt", localSystemPromptPath ?? renderedSystemPromptExtension);');
+  output.piExecute = replaceOnce(output.piExecute,
+    '            args.push(userPrompt);',
+    '            if (executionTargetIsRemote || userPrompt.trim().length === 0) args.push(userPrompt);');
+  output.piExecute = replaceOnce(output.piExecute,
+    '                env: executionTargetIsRemote ? env : runtimeEnv,',
+    '                env: executionTargetIsRemote ? env : runtimeEnv,\n                stdin: !executionTargetIsRemote && userPrompt.trim().length > 0 ? userPrompt : undefined,');
+  output.piExecute = replaceOnce(output.piExecute,
+    '        await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup()]);',
+    '        await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup(), localSystemPromptDir ? fs.rm(localSystemPromptDir, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve()]);');
   output.conversation = replaceOnce(output.conversation,
     '    "pi_local", "grok_local", "kimi_local", "hermes_local",',
     '    "pi_local", "grok_local", "kimi_local", "hermes_local", "openrouter",');
@@ -210,6 +285,7 @@ export function enforceOpenRouterRecovery(root = fileURLToPath(new URL("..", imp
     completion: join(base, "server", "dist", "services", "heartbeat", "run-completion.js"),
     recovery: join(base, "server", "dist", "services", "recovery", "service.js"),
     pi: join(base, "adapter-pi-local", "dist", "server", "runtime-config.js"),
+    piExecute: join(base, "adapter-pi-local", "dist", "server", "execute.js"),
     conversation: join(base, "server", "dist", "services", "conversation-continuation.js"),
     queue: join(base, "server", "dist", "services", "heartbeat", "queue.js"),
     lifecycle: join(base, "server", "dist", "modules", "agent-lifecycle", "adapters", "postgres.js"),
