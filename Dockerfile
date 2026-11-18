@@ -5,7 +5,7 @@ FROM node:24-slim
 # agent CLIs (codex/claude) use the OS trust store for TLS to api.openai.com / api.anthropic.com.
 # Without it, agent runs fail with "no native root CA certificates found". (Node's own fetch is
 # unaffected because Node bundles its own CAs.)
-RUN apt-get update && apt-get install -y --no-install-recommends gosu ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends gosu ca-certificates git curl && rm -rf /var/lib/apt/lists/*
 
 # Create a non-root user (required: Claude CLI refuses --dangerously-skip-permissions as root)
 RUN groupadd -r paperclip && useradd -r -g paperclip -m -d /home/paperclip -s /bin/bash paperclip
@@ -18,7 +18,9 @@ WORKDIR /app
 # Copy package files and install dependencies
 COPY package.json ./
 COPY scripts/patch-bundled-zod.mjs ./scripts/
-RUN npm install --omit=dev && node scripts/patch-bundled-zod.mjs
+COPY scripts/build-openrouter-adapter.mjs ./scripts/
+COPY adapters ./adapters
+RUN npm install --omit=dev && node scripts/patch-bundled-zod.mjs && npm run build
 
 # Copy application code
 COPY . .

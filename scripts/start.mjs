@@ -24,6 +24,8 @@ import { join, dirname, resolve } from "path";
 import { fileURLToPath } from "url";
 import { homedir } from "os";
 import { patchBundledZod } from "./patch-bundled-zod.mjs";
+import { registerOpenRouterAdapter } from "./openrouter-adapter.mjs";
+import { attachUpgradeProxy } from "./proxy-upgrade.mjs";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -101,7 +103,7 @@ function updatePaperclip() {
   console.log("🔄 Checking for the latest Paperclip release...");
   const result = spawnSync(
     process.execPath,
-    [process.env.npm_execpath || "node_modules/npm/bin/npm-cli.js", "install", "--omit=dev", "--no-save", "--package-lock=false", "paperclipai@latest"],
+    [process.env.npm_execpath || "node_modules/npm/bin/npm-cli.js", "install", "--omit=dev", "--no-save", "--package-lock=false", "paperclipai@latest", "@paperclipai/adapter-pi-local@latest"],
     { cwd: APP_ROOT, stdio: "inherit" },
   );
   if (result.error || result.status !== 0) {
@@ -844,6 +846,7 @@ function startServer() {
     proxy(req, res);
   });
 
+  attachUpgradeProxy(server, { port: PAPERCLIP_PORT, ready: () => paperclipReady });
   server.listen(PUBLIC_PORT, "0.0.0.0", () => {
     console.log(`\n🔧 Wrapper listening on port ${PUBLIC_PORT}`);
     console.log(`   Visit /setup to configure or manage your instance.\n`);
@@ -860,6 +863,11 @@ const shouldSeedGeminiConfig =
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   updatePaperclip();
+  const adapterBuild = spawnSync(process.execPath, [join(__dirname, "build-openrouter-adapter.mjs")], { stdio: "inherit" });
+  if (adapterBuild.error || adapterBuild.status !== 0) {
+    throw new Error("Could not build the OpenRouter adapter UI parser.");
+  }
+  registerOpenRouterAdapter();
   patchBundledZod();
   enforceAgentRetryPolicy();
   enforceGeminiAcpModelCompatibility();

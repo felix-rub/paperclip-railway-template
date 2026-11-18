@@ -10,6 +10,52 @@ Railway doesn't provide shell access during deployment, so the normal `pnpm pape
 
 ---
 
+## OpenRouter adapter
+
+This wrapper bundles an external **OpenRouter** adapter (`openrouter`). It is
+registered automatically under **Settings > Adapters** and is selectable when
+creating or configuring an agent. Existing agents are not migrated.
+
+1. Select **OpenRouter** as the adapter.
+2. Choose a tool-capable model from the live OpenRouter catalog, or enter its
+   OpenRouter slug (for example `anthropic/claude-sonnet-4.5`).
+3. Store your key in **Settings > Secrets**. In the agent environment editor,
+   add `OPENROUTER_API_KEY` as a reference to that secret. A server-level
+   `OPENROUTER_API_KEY` also works, but is shared by agents on the instance.
+4. Leave thinking off unless the selected model supports it. Run the environment
+   test, then a small task. Both can spend OpenRouter credits.
+
+Do not paste a key into the model, prompt, or an ordinary configuration text field.
+Managed AI-account bindings are not supported by this external adapter; use the
+secret-backed environment entry instead. Keys are not included in the repository.
+
+OpenRouter handles inference directly. Pi's pinned coding-agent runtime supplies
+the tool loop, workspace tools, instructions, skills, streaming, session resume,
+and usage accounting. This does **not** invoke OpenCode, Codex, or Claude Code.
+The wrapper forwards authenticated WebSocket upgrades for live run updates.
+Catalog metadata supplies context/output limits and estimated token prices; actual
+OpenRouter billing may differ with provider routing and tiered pricing.
+
+Sessions persist under `/paperclip/openrouter/sessions`. On first boot, the wrapper
+links Pi's session directory there. It refuses to overwrite an existing Pi session
+directory or a different installed adapter named `openrouter`.
+
+For local development, run `npm install`, `npm run build`, then `npm test`.
+The generated browser transcript parser is bundled from Paperclip's Pi adapter.
+
+### Upstream channels
+
+Production follows the public `paperclipai@latest` stable channel, not the age of
+the Railway template. The Pi integration is refreshed alongside Paperclip on boot.
+As checked on 2026-11-18, stable is `2026.1106.0`; newer public builds exist on
+`beta`, `nightly`, and `canary`, but are prereleases. Neither the stable source nor
+public development head has a standalone OpenRouter adapter. Upgrading to a
+prerelease is a separate migration and should be tested before using production
+data. The bundled adapter uses the supported external-adapter API instead of
+patching Paperclip's built-in adapter list.
+
+---
+
 ## Deploy to Railway
 
 [![Deploy on Railway](https://railway.com/button.svg)](https://railway.com/deploy/paperclip-ai-company?referralCode=QXdhdr&utm_medium=integration&utm_source=template&utm_campaign=generic)

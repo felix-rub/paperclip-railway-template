@@ -5,14 +5,18 @@
   "private": true,
   "scripts": {
     "start": "node scripts/start.mjs",
-    "build": "echo 'No build step required'"
+    "build": "node scripts/build-openrouter-adapter.mjs",
+    "test": "node --test scripts/start.test.mjs scripts/openrouter-adapter.test.mjs adapters/openrouter/adapter.test.mjs"
   },
   "dependencies": {
     "paperclipai": "latest",
     "@anthropic-ai/claude-code": "latest",
     "@openai/codex": "latest",
     "@google/gemini-cli": "latest",
-    "opencode-ai": "1.18.20"
+    "opencode-ai": "1.18.20",
+    "@paperclipai/adapter-pi-local": "latest",
+    "@earendil-works/pi-coding-agent": "0.74.0",
+    "esbuild": "0.27.0"
   },
   "overrides": {
     "svix": "1.99.1",

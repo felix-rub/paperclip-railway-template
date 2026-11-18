@@ -1,0 +1,16 @@
+{
+  "name": "paperclip-openrouter-adapter",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.mjs",
+    "./ui-parser": "./ui-parser.js"
+  },
+  "paperclip": {
+    "adapterUiParser": "1.0.0"
+  },
+  "peerDependencies": {
+    "@paperclipai/adapter-pi-local": ">=2026.1106.0"
+  }
+}

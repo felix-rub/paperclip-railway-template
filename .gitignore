@@ -1,4 +1,5 @@
 node_modules/
+adapters/openrouter/ui-parser.js
 .env
 .env.local
 *.log

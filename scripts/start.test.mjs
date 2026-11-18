@@ -3,7 +3,9 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "node:http";
+import { createServer, request } from "node:http";
+import { once } from "node:events";
+import { attachUpgradeProxy } from "./proxy-upgrade.mjs";
 import { enforceAgentRetryPolicy, enforceGeminiAcpModelCompatibility, watchPaperclipReadiness } from "./start.mjs";
 import { patchBundledZod } from "./patch-bundled-zod.mjs";
 
@@ -166,4 +168,84 @@ test("replaces vulnerable bundled Zod and preserves newer versions", () => {
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+async function upgradeServers(t, ready, handleUpgrade) {
+  const sockets = new Set();
+  const upstream = createServer();
+  upstream.on("upgrade", handleUpgrade);
+  const proxy = createServer();
+  for (const server of [upstream, proxy]) {
+    server.on("connection", socket => {
+      sockets.add(socket);
+      socket.once("close", () => sockets.delete(socket));
+    });
+  }
+  t.after(async () => {
+    for (const socket of sockets) socket.destroy();
+    await Promise.all([upstream, proxy].map(server => new Promise(resolve => server.close(resolve))));
+  });
+  upstream.listen(0, "127.0.0.1");
+  await once(upstream, "listening");
+  attachUpgradeProxy(proxy, { port: upstream.address().port, ready: () => ready });
+  proxy.listen(0, "127.0.0.1");
+  await once(proxy, "listening");
+  return () => request({
+    hostname: "127.0.0.1", port: proxy.address().port, path: "/events/ws",
+    headers: { Connection: "Upgrade", Upgrade: "websocket", Cookie: "session=test" },
+  });
+}
+
+test("WebSocket proxy preserves authentication headers and bidirectional bytes", { timeout: 5000 }, async t => {
+  let received;
+  const makeRequest = await upgradeServers(t, true, (req, socket) => {
+    received = req.headers;
+    socket.write("HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\nserver-head");
+    socket.on("data", data => socket.write(data));
+  });
+  const req = makeRequest();
+  const upgraded = once(req, "upgrade");
+  req.end();
+  const [response, socket, head] = await upgraded;
+  t.after(() => socket.destroy());
+  assert.equal(response.statusCode, 101);
+  assert.equal(received.cookie, "session=test");
+  assert.equal(received["x-forwarded-proto"], "https");
+  assert.ok(received["x-forwarded-host"].startsWith("127.0.0.1:"));
+  assert.equal(head.toString(), "server-head");
+  const reply = once(socket, "data");
+  socket.write("client-roundtrip");
+  assert.equal((await reply)[0].toString(), "client-roundtrip");
+});
+
+test("WebSocket proxy preserves upstream authentication failures", { timeout: 5000 }, async t => {
+  const makeRequest = await upgradeServers(t, true, (_, socket) => {
+    socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
+  });
+  const req = makeRequest();
+  const response = once(req, "response");
+  req.end();
+  const [res] = await response;
+  assert.equal(res.statusCode, 401);
+  res.resume();
+});
+
+test("WebSocket proxy refuses upgrades before Paperclip is ready", { timeout: 5000 }, async t => {
+  const makeRequest = await upgradeServers(t, false, () => assert.fail("not ready"));
+  const req = makeRequest();
+  const response = once(req, "response");
+  req.end();
+  const [res] = await response;
+  assert.equal(res.statusCode, 503);
+  res.resume();
+});
+
+test("WebSocket proxy bounds a stalled upstream handshake", { timeout: 20000 }, async t => {
+  const makeRequest = await upgradeServers(t, true, () => {});
+  const req = makeRequest();
+  const response = once(req, "response");
+  req.end();
+  const [res] = await response;
+  assert.equal(res.statusCode, 502);
+  res.resume();
 });
