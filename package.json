@@ -15,7 +15,7 @@
     "@google/gemini-cli": "latest",
     "opencode-ai": "1.18.20",
     "@paperclipai/adapter-pi-local": "latest",
-    "@earendil-works/pi-coding-agent": "0.74.0",
+    "@earendil-works/pi-coding-agent": "0.78.1",
     "esbuild": "0.27.0"
   },
   "overrides": {

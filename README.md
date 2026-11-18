@@ -42,6 +42,8 @@ directory or a different installed adapter named `openrouter`.
 
 For local development, run `npm install`, `npm run build`, then `npm test`.
 The generated browser transcript parser is bundled from Paperclip's Pi adapter.
+The CLI is pinned to patched Pi `0.78.1`; runtime upgrades must preserve tool
+execution and session resume.
 
 ### Upstream channels
 

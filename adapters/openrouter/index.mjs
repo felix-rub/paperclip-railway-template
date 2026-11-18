@@ -2,7 +2,7 @@ import * as piRuntime from "@paperclipai/adapter-pi-local/server";
 import { randomUUID } from "node:crypto";
 import { createCatalog } from "./catalog.mjs";
 
-const INSTALL_COMMAND = "npm install -g @earendil-works/pi-coding-agent@0.74.0";
+const INSTALL_COMMAND = "npm install -g @earendil-works/pi-coding-agent@0.78.1";
 const DOC = `# OpenRouter adapter
 
 Select OpenRouter as the agent adapter and choose a tool-capable model.
