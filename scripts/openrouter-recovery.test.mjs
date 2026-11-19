@@ -7,6 +7,7 @@ import {
   openRouterLocalTerminationProof,
   openRouterRetryOptions,
   orderQueuedAgentIds,
+  orderQueuedAgents,
   patchOpenRouterSources,
   reconcileOpenRouterRetries,
   scheduleOpenRouterRetrySweep,
@@ -70,10 +71,10 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.recovery, /const \[fullLatestRun\] = await db\.select\(\)\.from\(heartbeatRuns\)/);
   assert.match(patched.recovery, /runUsedConversationAdapter\(db, fullLatestRun\)/);
   assert.doesNotMatch(patched.recovery, /runUsedConversationAdapter\(db, latestRun\)/);
-  assert.match(patched.queue, /selectDistinct\(\{ agentId: heartbeatRuns\.agentId \}\)/);
+  assert.match(patched.queue, /selectDistinct\(\{ agentId: heartbeatRuns\.agentId, companyId: heartbeatRuns\.companyId \}\)/);
   assert.match(patched.queue, /openRouterQueuedRunClaimableSql\(heartbeatRuns, sql\)/);
   assert.match(patched.queue, /selectClaimableQueuedRuns\(db, agent, heartbeatRuns,/);
-  assert.match(patched.queue, /orderQueuedAgentIds\(/);
+  assert.match(patched.queue, /orderQueuedAgents\(/);
   assert.match(patched.queue, /const claimedRuns = await withOpenRouterClaimLock\(agent, async \(\) => \{/);
   assert.match(patched.queue, /limitOpenRouterAvailableSlots\(db, agent,/);
   assert.match(patched.queue, /triggerOpenRouterQueueDrain\(\(\) => resumeQueuedRunsAfterDrain\(\), logger\)/);
@@ -169,6 +170,17 @@ test("OpenRouter global concurrency lock, slot cap, and drain coalescer prevent 
   assert.equal(firstOrder.length, 3);
   assert.notDeepEqual(firstOrder, secondOrder);
   assert.notDeepEqual(secondOrder, thirdOrder);
+
+  const rows = [
+    { companyId: "b-company", agentId: "b1" },
+    { companyId: "a-company", agentId: "a1" },
+    { companyId: "b-company", agentId: "b2" },
+    { companyId: "a-company", agentId: "a2" },
+  ];
+  const fair = orderQueuedAgents(rows);
+  assert.notEqual(fair[0][0], fair[1][0], "First queue turn must alternate companies.");
+  assert.equal(fair.length, 4);
+  assert.deepEqual(new Set(fair.slice(0, 2)).size, 2);
 });
 
 test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready agents, and wakes queue dispatch", async () => {
@@ -182,6 +194,12 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
       return fn({ isTransaction: true });
     },
     async execute(query) {
+      if (query.text.includes("update budget_policies p")) return { rows: [] };
+      if (query.text.includes("insert into budget_policies")) return { rows: [] };
+      if (query.text.includes("budget_monthly_cents")) return { rows: [] };
+      if (query.text.includes("from routines r")) return { rows: [] };
+      if (query.text.includes("with target_issues as")) return { rows: [] };
+      if (query.text.includes("count(distinct a.id)")) return { rows: [] };
       if (query.text.includes("set status = 'idle'")) return { rows: [{ id: "agent-healed-1" }] };
       if (query.text.includes("and a.lifecycle_state = 'paused'")) return { rows: [{ id: "agent-paused-1" }] };
       if (query.text.includes("a.lifecycle_state in ('verifying', 'preparing', 'resuming')")) {
