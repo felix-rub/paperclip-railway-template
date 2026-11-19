@@ -104,7 +104,7 @@ function updatePaperclip() {
   console.log("🔄 Checking for the latest Paperclip release...");
   const result = spawnSync(
     process.execPath,
-    [process.env.npm_execpath || "node_modules/npm/bin/npm-cli.js", "install", "--omit=dev", "--no-save", "--package-lock=false", "paperclipai@latest", "@paperclipai/adapter-pi-local@latest"],
+    [process.env.npm_execpath || "node_modules/npm/bin/npm-cli.js", "install", "--omit=dev", "--no-save", "--package-lock=false", "paperclipai@latest", "@paperclipai/adapter-pi-local@latest", "@earendil-works/pi-coding-agent@0.78.1"],
     { cwd: APP_ROOT, stdio: "inherit" },
   );
   if (result.error || result.status !== 0) {
@@ -572,6 +572,11 @@ function startPaperclip() {
   writeConfig();
   seedCodexAuth();
 
+  const pathDelimiter = process.platform === "win32" ? ";" : ":";
+  const appBinDir = join(APP_ROOT, "node_modules", ".bin");
+  const currentPath = process.env.PATH || process.env.Path || "";
+  const prioritizedPath = [appBinDir, ...currentPath.split(pathDelimiter).filter((entry) => entry && entry !== appBinDir)].join(pathDelimiter);
+
   paperclipProc = spawn(
     "node",
     ["node_modules/.bin/paperclipai", "run"],
@@ -579,6 +584,7 @@ function startPaperclip() {
       stdio: ["ignore", "pipe", "pipe"],
       env: {
         ...process.env,
+        PATH: prioritizedPath,
         PAPERCLIP_CONFIG: CONFIG_PATH,
         PAPERCLIP_HOME: HOME,
         PORT: String(PAPERCLIP_PORT),

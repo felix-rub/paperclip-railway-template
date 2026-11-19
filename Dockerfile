@@ -20,7 +20,7 @@ COPY package.json ./
 COPY scripts/patch-bundled-zod.mjs ./scripts/
 COPY scripts/build-openrouter-adapter.mjs ./scripts/
 COPY adapters ./adapters
-RUN npm install --omit=dev && node scripts/patch-bundled-zod.mjs && npm run build
+RUN npm install --omit=dev && node scripts/patch-bundled-zod.mjs && npm run build && ln -sf /app/node_modules/.bin/pi /usr/local/bin/pi
 
 # Copy application code
 COPY . .

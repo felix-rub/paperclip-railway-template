@@ -273,11 +273,102 @@ export async function hasOpenRouterHourlyWait(db, agent, sql) {
   return rows.length > 0;
 }
 
+const bootUnparkedDbs = new WeakSet();
+const stateLogTimestamps = new WeakMap();
+const STATE_LOG_INTERVAL_MS = 5 * 60_000;
+
+export async function reconcileOpenRouterAgentReadiness(db, deps, sql, logger) {
+  if (typeof deps?.scheduleAgentLifecycle !== "function") {
+    return { healedAgents: 0, resumedAgents: 0, unparkedAgents: 0 };
+  }
+  const isFirstBootSweep = typeof db === "object" && db !== null && !bootUnparkedDbs.has(db);
+  const healedRes = await db.execute(sql`
+    update agents a
+    set status = 'idle',
+        pause_reason = null,
+        paused_at = null,
+        updated_at = now()
+    from companies c
+    where c.id = a.company_id
+      and c.status = 'active'
+      and a.adapter_type = 'openrouter'
+      and a.lifecycle_state = 'ready'
+      and coalesce(a.lifecycle_holds, '[]'::jsonb) = '[]'::jsonb
+      and a.status in ('paused', 'error')
+    returning a.id
+  `);
+  const healedRows = healedRes.rows ?? healedRes;
+  const healedAgents = Array.isArray(healedRows) ? healedRows.length : 0;
+
+  let resumedAgents = 0;
+  if (typeof deps?.reconcileAgentLifecycle === "function") {
+    const pausedRes = await db.execute(sql`
+      select a.id
+      from agents a
+      join companies c on c.id = a.company_id and c.status = 'active'
+      where a.adapter_type = 'openrouter'
+        and a.lifecycle_state = 'paused'
+        and coalesce(a.lifecycle_holds, '[]'::jsonb) = '[]'::jsonb
+    `);
+    const pausedRows = pausedRes.rows ?? pausedRes;
+    if (Array.isArray(pausedRows)) {
+      for (const row of pausedRows) {
+        try {
+          await deps.reconcileAgentLifecycle(db, row.id);
+          resumedAgents += 1;
+        } catch (error) {
+          logger?.error?.({ err: error, agentId: row.id }, "OpenRouter paused agent lifecycle reconcile failed");
+        }
+      }
+    }
+  }
+
+  const unparkRes = await db.execute(sql`
+    update agents a
+    set lifecycle_error = null,
+        lifecycle_operation = coalesce(a.lifecycle_operation, '{}'::jsonb)
+          - 'retryAt' - 'retryRequired' - 'verificationFailures'
+          - 'leaseOwner' - 'leaseUntil' - 'leaseHolder'
+          - 'waitingForSignal' - 'recheckRequested',
+        updated_at = now()
+    from companies c
+    where c.id = a.company_id
+      and c.status = 'active'
+      and a.adapter_type = 'openrouter'
+      and a.lifecycle_state in ('verifying', 'preparing', 'resuming')
+      and not (coalesce(a.lifecycle_holds, '[]'::jsonb) @> '["setup"]'::jsonb)
+      and coalesce((a.lifecycle_operation->>'leaseUntil')::timestamptz, '-infinity') <= now()
+      and (
+        coalesce(a.lifecycle_operation->>'retryRequired', 'false') = 'true'
+        or coalesce(a.lifecycle_operation->>'waitingForSignal', 'false') = 'true'
+        or (${isFirstBootSweep} and a.lifecycle_state = 'verifying' and coalesce((a.lifecycle_operation->>'retryAt')::timestamptz, '-infinity') > now())
+      )
+    returning a.id
+  `);
+  if (isFirstBootSweep) {
+    bootUnparkedDbs.add(db);
+  }
+  const unparkRows = unparkRes.rows ?? unparkRes;
+  let unparkedAgents = 0;
+  if (Array.isArray(unparkRows)) {
+    for (const row of unparkRows) {
+      try {
+        await deps.scheduleAgentLifecycle(db, row.id);
+        unparkedAgents += 1;
+      } catch (error) {
+        logger?.error?.({ err: error, agentId: row.id }, "OpenRouter lifecycle reschedule failed");
+      }
+    }
+  }
+  return { healedAgents, resumedAgents, unparkedAgents, isFirstBootSweep };
+}
+
 // The ordinary retry service owns locks, authorization, session inheritance and
 // successor deduplication. This sweep only recovers terminal work it missed.
 export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {}) {
   if (!deps.scheduleRecoveryRetry) return { selected: 0, scheduled: 0 };
   const limit = Number.isSafeInteger(opts?.limit) && opts.limit > 0 ? opts.limit : DEFAULT_DIRECT_SWEEP_LIMIT;
+  const readiness = await reconcileOpenRouterAgentReadiness(db, deps, sql, logger);
   await db.execute(sql`
     update heartbeat_runs waiting
     set scheduled_retry_at = predecessor.finished_at + interval '1 hour',
@@ -433,7 +524,57 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {
       logger.error({ err: error, runId: row.id }, "OpenRouter hourly retry scheduling failed; the next sweep will retry");
     }
   }
-  return { selected: rows.length, scheduled };
+  if (typeof deps?.scheduleAgentLifecycle === "function") {
+    try {
+      const summaryRes = await db.execute(sql`
+        select
+          (select count(*)::int from agents a join companies c on c.id = a.company_id and c.status = 'active'
+            where a.adapter_type = 'openrouter' and a.lifecycle_state = 'ready' and a.status not in ('paused', 'terminated', 'pending_approval')) as ready_agents,
+          (select count(*)::int from agents a join companies c on c.id = a.company_id and c.status = 'active'
+            where a.adapter_type = 'openrouter' and a.lifecycle_state = 'verifying') as verifying_agents,
+          (select count(*)::int from agents a join companies c on c.id = a.company_id and c.status = 'active'
+            where a.adapter_type = 'openrouter' and (a.lifecycle_state = 'paused' or a.status = 'paused')) as paused_agents,
+          (select count(*)::int from heartbeat_runs r join agents a on a.id = r.agent_id and a.company_id = r.company_id join companies c on c.id = r.company_id and c.status = 'active'
+            where a.adapter_type = 'openrouter' and r.status = 'running') as running_runs,
+          (select count(*)::int from heartbeat_runs r join agents a on a.id = r.agent_id and a.company_id = r.company_id join companies c on c.id = r.company_id and c.status = 'active'
+            where a.adapter_type = 'openrouter' and r.status = 'queued') as queued_runs,
+          (select count(*)::int from heartbeat_runs r join agents a on a.id = r.agent_id and a.company_id = r.company_id join companies c on c.id = r.company_id and c.status = 'active'
+            where a.adapter_type = 'openrouter' and r.status = 'scheduled_retry') as scheduled_retry_runs
+      `);
+      const summaryRow = (summaryRes.rows ?? summaryRes)?.[0] ?? {};
+      const readyAgents = Number(summaryRow.ready_agents ?? 0);
+      const verifyingAgents = Number(summaryRow.verifying_agents ?? 0);
+      const pausedAgents = Number(summaryRow.paused_agents ?? 0);
+      const runningRuns = Number(summaryRow.running_runs ?? 0);
+      const queuedRuns = Number(summaryRow.queued_runs ?? 0);
+      const scheduledRetryRuns = Number(summaryRow.scheduled_retry_runs ?? 0);
+      if (readyAgents > 0 && queuedRuns > 0 && runningRuns < resolveOpenRouterMaxConcurrentRuns()) {
+        await deps.notifyQueuedRunDispatch?.(db);
+      }
+      const now = Date.now();
+      const lastLoggedAt = stateLogTimestamps.get(db) ?? 0;
+      const changed = (readiness.healedAgents + readiness.resumedAgents + readiness.unparkedAgents + scheduled) > 0;
+      if (readiness.isFirstBootSweep || changed || now - lastLoggedAt >= STATE_LOG_INTERVAL_MS) {
+        stateLogTimestamps.set(db, now);
+        logger?.info?.({
+          tag: "openrouter.reconcile.state",
+          readyAgents,
+          verifyingAgents,
+          pausedAgents,
+          runningRuns,
+          queuedRuns,
+          scheduledRetryRuns,
+          unparkedAgents: readiness.unparkedAgents,
+          healedAgents: readiness.healedAgents,
+          resumedAgents: readiness.resumedAgents,
+          scheduledRetries: scheduled,
+        }, "OpenRouter readiness and retry state");
+      }
+    } catch (error) {
+      logger?.error?.({ err: error }, "OpenRouter readiness summary failed");
+    }
+  }
+  return { selected: rows.length, scheduled, ...readiness };
 }
 
 const sweepStates = new WeakMap();
@@ -550,11 +691,14 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
       'await (failedAgent.adapterType === "openrouter" || isTransientWorkspaceGitScanCode(livenessRun.errorCode)',
     ]);
   output.recovery = replaceOnce(output.recovery,
+    'import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";',
+    'import { notifyQueuedRunDispatch, notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";');
+  output.recovery = replaceOnce(output.recovery,
     'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";',
-    'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";\nimport { runUsedConversationAdapter } from "../conversation-continuation.js";');
+    'import { isAgentAwaitingSetup, reconcileAgentLifecycle, scheduleAgentLifecycle } from "../../modules/agent-lifecycle/index.js";\nimport { runUsedConversationAdapter } from "../conversation-continuation.js";');
   output.recovery = replaceOnce(output.recovery,
     '    async function reconcileStrandedAssignedIssues(opts) {',
-    '    async function reconcileStrandedAssignedIssues(opts) {\n        scheduleOpenRouterRetrySweep(db, deps, sql, logger);');
+    '    async function reconcileStrandedAssignedIssues(opts) {\n        scheduleOpenRouterRetrySweep(db, { ...deps, reconcileAgentLifecycle, scheduleAgentLifecycle, notifyQueuedRunDispatch }, sql, logger);');
   if (!output.recovery.includes(imported("scheduleOpenRouterRetrySweep"))) {
     output.recovery = imported("scheduleOpenRouterRetrySweep") + output.recovery;
   }
@@ -763,6 +907,9 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
   if (!output.queue.includes(queueImports)) {
     output.queue = queueImports + output.queue;
   }
+  output.lifecycle = replaceOnce(output.lifecycle,
+    'const retry = options?.retryRequired && agent.lifecycleState === "verifying"',
+    'const retry = options?.retryRequired && agent.lifecycleState === "verifying" && agent.adapterType !== "openrouter"');
   output.lifecycle = replaceOnce(output.lifecycle,
     'new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString()',
     'new Date(now.getTime() + (error ? (agent.adapterType === "openrouter" && agent.lifecycleState === "verifying" ? 3_600_000 : 60_000) : 2_000)).toISOString()');

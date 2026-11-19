@@ -1,5 +1,6 @@
 import * as piRuntime from "@paperclipai/adapter-pi-local/server";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +10,14 @@ import { COMPACT_PROMPT } from "./policy.mjs";
 
 const POLICY_PATH = fileURLToPath(new URL("./pi-policy.mjs", import.meta.url));
 const FREE_MODEL = "openrouter/free";
+const KEY_URL = "https://openrouter.ai/api/v1/key";
+const KEY_VERIFY_TTL_MS = 60_000;
+
+export function resolveDefaultPiCommand() {
+  const binName = process.platform === "win32" ? "pi.cmd" : "pi";
+  const bundled = fileURLToPath(new URL(`../../node_modules/.bin/${binName}`, import.meta.url));
+  return existsSync(bundled) ? bundled : "pi";
+}
 
 function positiveInt(value, field, fallback) {
   const parsed = value ?? fallback;
@@ -123,12 +132,61 @@ function redactSecrets(value, extraSecret = "") {
   return out.slice(0, 300);
 }
 
-export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, minStartIntervalMs, onTelemetry } = {}) {
+export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, minStartIntervalMs, onTelemetry, piCommand } = {}) {
   const catalog = createCatalog(fetchImpl);
   const isDefaultFetch = fetchImpl === fetch;
+  const defaultPiCommand = piCommand ?? resolveDefaultPiCommand();
   const waitForStartSlot = minStartIntervalMs === undefined ? sharedStartPacer : createStartPacer();
   const emitTelemetry = typeof onTelemetry === "function" ? onTelemetry : (entry) => console.log(JSON.stringify(entry));
-  async function prepareConfig(config) {
+  const keyVerifyCache = new Map();
+
+  async function verifyApiKey(apiKey) {
+    const keyDigest = createHash("sha256").update(apiKey).digest("hex");
+    const now = Date.now();
+    const cached = keyVerifyCache.get(keyDigest);
+    if (cached && cached.expiresAt > now) {
+      return { ok: true };
+    }
+    let response;
+    try {
+      response = await fetchImpl(KEY_URL, {
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${apiKey}`,
+          "HTTP-Referer": "https://paperclip.ing",
+          "X-Title": "Paperclip",
+        },
+        signal: AbortSignal.timeout(15_000),
+      });
+    } catch (error) {
+      return {
+        ok: false,
+        code: "openrouter_key_probe_unavailable",
+        retryable: true,
+        message: redactSecrets(errorText(error), apiKey) ?? "OpenRouter key verification failed.",
+      };
+    }
+    if (response.status === 401 || response.status === 403) {
+      return {
+        ok: false,
+        code: "openrouter_hello_probe_auth_required",
+        retryable: false,
+        message: "OpenRouter rejected OPENROUTER_API_KEY.",
+      };
+    }
+    if (!response.ok) {
+      return {
+        ok: false,
+        code: "openrouter_key_probe_unavailable",
+        retryable: true,
+        message: `OpenRouter key verification returned HTTP ${response.status}.`,
+      };
+    }
+    keyVerifyCache.set(keyDigest, { expiresAt: now + KEY_VERIFY_TTL_MS });
+    return { ok: true };
+  }
+
+  async function prepareConfig(config, options = {}) {
     if ((Array.isArray(config.extraArgs) && config.extraArgs.length) ||
         (Array.isArray(config.args) && config.args.length)) {
       throw new Error("OpenRouter does not accept extra CLI arguments; free routing is managed by the server.");
@@ -153,7 +211,7 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
       fallbackModels: "",
       escalationModel: "",
       profile,
-      command: "pi",
+      command: options.executionTarget?.kind === "ssh" ? "pi" : defaultPiCommand,
       model: `openrouter/${model.id}`,
       thinking,
       timeoutSec,
@@ -216,13 +274,14 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
           state: {},
         };
       }
-      const result = await runtime.execute({ ...ctx, config: attempt });
       let state = null;
-      try {
-        state = JSON.parse(await readFile(outcome, "utf8"));
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
+      const readOutcomeState = async (ignoreInvalid = false) => {
+        try {
+          state = JSON.parse(await readFile(outcome, "utf8"));
+        } catch (error) {
+          if (error.code !== "ENOENT" && !ignoreInvalid) throw error;
+        }
+      };
       const recordInvokeTelemetry = (finalResult) => {
         const providerTelemetry = state?.providerTelemetry ?? null;
         try {
@@ -246,6 +305,18 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
           // Never fail execution due to telemetry logging.
         }
       };
+      let result;
+      try {
+        result = await runtime.execute({ ...ctx, config: attempt });
+      } catch (error) {
+        await readOutcomeState(true);
+        const redacted = redactSecrets(errorText(error), config.env?.OPENROUTER_API_KEY) ?? "OpenRouter runtime execution failed.";
+        await ctx.onLog?.("stderr", `${redacted}\n`);
+        const crashed = failResult("adapter_failed", redacted);
+        recordInvokeTelemetry(crashed);
+        return { result: crashed, state: state ?? {} };
+      }
+      await readOutcomeState(false);
       if (!policy.compact) {
         recordInvokeTelemetry(result);
         return { result, state: state ?? {} };
@@ -292,8 +363,8 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
     listModels: async () => (await catalog.list()).filter(model => model.id === FREE_MODEL),
     refreshModels: async () => (await catalog.list(true)).filter(model => model.id === FREE_MODEL),
     getRuntimeCommandSpec: () => ({
-      command: "pi",
-      detectCommand: "pi",
+      command: defaultPiCommand,
+      detectCommand: defaultPiCommand,
       installCommand: INSTALL_COMMAND,
     }),
     async getConfigSchema() {
@@ -323,10 +394,10 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
       let config;
       let policy;
       try {
-        config = await prepareConfig(ctx.config);
+        config = await prepareConfig(ctx.config, { executionTarget: ctx.executionTarget });
         policy = await preparePolicy(config, ctx);
       } catch (error) {
-        const message = errorText(error);
+        const message = redactSecrets(errorText(error), ctx.config?.env?.OPENROUTER_API_KEY) ?? errorText(error);
         await ctx.onLog("stderr", `${message}\n`);
         return {
           exitCode: 1, signal: null, timedOut: false,
@@ -342,7 +413,52 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
     async testEnvironment(ctx) {
       let config;
       try {
-        config = await prepareConfig(ctx.config);
+        config = await prepareConfig(ctx.config, { executionTarget: ctx.executionTarget });
+        if (runtime === piRuntime && ctx.executionTarget?.kind !== "ssh") {
+          const keyCheck = await verifyApiKey(config.env.OPENROUTER_API_KEY);
+          if (!keyCheck.ok) {
+            return {
+              adapterType: "openrouter",
+              status: "fail",
+              checks: [{
+                code: keyCheck.code,
+                level: "error",
+                ...(keyCheck.retryable ? { retryable: true } : {}),
+                message: keyCheck.message,
+              }],
+              testedAt: new Date().toISOString(),
+            };
+          }
+          try {
+            await piRuntime.ensurePiModelConfiguredAndAvailable({
+              model: config.model,
+              command: config.command,
+              cwd: config.cwd || process.cwd(),
+              env: config.env,
+            });
+          } catch (error) {
+            return {
+              adapterType: "openrouter",
+              status: "fail",
+              checks: [{
+                code: "openrouter_hello_probe_model_unavailable",
+                level: "error",
+                message: redactSecrets(errorText(error), config.env.OPENROUTER_API_KEY) ?? "Configured Pi model is unavailable.",
+              }],
+              testedAt: new Date().toISOString(),
+            };
+          }
+          return {
+            adapterType: "openrouter",
+            status: "pass",
+            checks: [{
+              code: "openrouter_hello_probe_passed",
+              level: "info",
+              message: "OpenRouter API key, $0 openrouter/free catalog entry, and bundled Pi CLI model availability verified.",
+            }],
+            testedAt: new Date().toISOString(),
+          };
+        }
         const providers = JSON.parse(config.env.PAPERCLIP_PI_PROVIDERS);
         providers.openrouter.models[0].maxTokens = Math.min(providers.openrouter.models[0].maxTokens, 256);
         // Pi's standalone probe skips custom providers. Exercise the real

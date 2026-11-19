@@ -6,6 +6,7 @@ import {
   openRouterRetryOptions,
   orderQueuedAgentIds,
   patchOpenRouterSources,
+  reconcileOpenRouterRetries,
   scheduleOpenRouterRetrySweep,
   triggerOpenRouterQueueDrain,
   withOpenRouterClaimLock,
@@ -44,8 +45,9 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.retries, /opts = openRouterRetryOptions/);
   assert.match(patched.retries, /openRouterPrevAdapter !== "openrouter"/);
   assert.match(patched.completion, /"failed", "timed_out", "interrupted"/);
-  assert.match(patched.recovery, /scheduleOpenRouterRetrySweep\(db, deps, sql, logger\);/);
+  assert.match(patched.recovery, /scheduleOpenRouterRetrySweep\(db, \{ \.\.\.deps, reconcileAgentLifecycle, scheduleAgentLifecycle, notifyQueuedRunDispatch \}, sql, logger\);/);
   assert.doesNotMatch(patched.recovery, /await reconcileOpenRouterRetries/);
+  assert.match(patched.lifecycle, /agent\.adapterType !== "openrouter"/);
   assert.match(patched.recovery, /const \[fullLatestRun\] = await db\.select\(\)\.from\(heartbeatRuns\)/);
   assert.match(patched.recovery, /runUsedConversationAdapter\(db, fullLatestRun\)/);
   assert.doesNotMatch(patched.recovery, /runUsedConversationAdapter\(db, latestRun\)/);
@@ -144,3 +146,59 @@ test("OpenRouter global concurrency lock, slot cap, and drain coalescer prevent 
   assert.notDeepEqual(firstOrder, secondOrder);
   assert.notDeepEqual(secondOrder, thirdOrder);
 });
+
+test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready agents, and wakes queue dispatch", async () => {
+  const scheduledLifecycles = [];
+  const reconciledAgents = [];
+  let notifiedQueue = 0;
+  const infoLogs = [];
+  const sqlTag = (strings, ...values) => ({ text: strings.join("?"), values });
+  const fakeDb = {
+    async execute(query) {
+      if (query.text.includes("set status = 'idle'")) return { rows: [{ id: "agent-healed-1" }] };
+      if (query.text.includes("and a.lifecycle_state = 'paused'")) return { rows: [{ id: "agent-paused-1" }] };
+      if (query.text.includes("a.lifecycle_state in ('verifying', 'preparing', 'resuming')")) {
+        return { rows: query.values[0] === true ? [{ id: "agent-verifying-1" }, { id: "agent-verifying-2" }] : [] };
+      }
+      if (query.text.includes("update heartbeat_runs waiting")) return { rows: [] };
+      if (query.text.includes("superseded_company_retries")) return { rows: [] };
+      if (query.text.includes("select r.id")) return { rows: [] };
+      if (query.text.includes("as ready_agents")) {
+        return {
+          rows: [{
+            ready_agents: 2,
+            verifying_agents: 0,
+            paused_agents: 0,
+            running_runs: 0,
+            queued_runs: 5,
+            scheduled_retry_runs: 3,
+          }],
+        };
+      }
+      throw new Error(`Unexpected SQL in test: ${query.text}`);
+    },
+  };
+  const deps = {
+    async scheduleRecoveryRetry() {},
+    async reconcileAgentLifecycle(_db, id) { reconciledAgents.push(id); },
+    async scheduleAgentLifecycle(_db, id) { scheduledLifecycles.push(id); },
+    async notifyQueuedRunDispatch() { notifiedQueue += 1; },
+  };
+  const logger = {
+    info(payload, msg) { infoLogs.push({ payload, msg }); },
+    error(payload, msg) { throw new Error(`${msg}: ${payload?.err?.message}`); },
+  };
+
+  const first = await reconcileOpenRouterRetries(fakeDb, deps, sqlTag, logger);
+  assert.equal(first.healedAgents, 1);
+  assert.equal(first.resumedAgents, 1);
+  assert.equal(first.unparkedAgents, 2);
+  assert.deepEqual(reconciledAgents, ["agent-paused-1"]);
+  assert.deepEqual(scheduledLifecycles, ["agent-verifying-1", "agent-verifying-2"]);
+  assert.equal(notifiedQueue, 1);
+  assert.equal(infoLogs[0].payload.tag, "openrouter.reconcile.state");
+
+  const second = await reconcileOpenRouterRetries(fakeDb, deps, sqlTag, logger);
+  assert.equal(second.unparkedAgents, 0, "Boot retryAt force-unpark runs once per DB process");
+});
+

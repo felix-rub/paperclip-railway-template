@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { createServerAdapter } from "./index.mjs";
+import { existsSync } from "node:fs";
+import { createServerAdapter, resolveDefaultPiCommand } from "./index.mjs";
 import { createCatalog, toRuntimeModel } from "./catalog.mjs";
 import { assertHarnessTestPassed } from "../../node_modules/@paperclipai/server/dist/services/agent-harness-verification.js";
 import { createGuard, createIssueTools, routeRequest } from "./policy.mjs";
@@ -93,7 +94,7 @@ test("adapter routes exclusively to OpenRouter and preserves lifecycle, session 
     sessionCodec: { serialize: value => value },
     async execute(ctx) {
       assert.equal(ctx.signal, controller.signal);
-      assert.equal(ctx.config.command, "pi");
+      assert.equal(ctx.config.command, resolveDefaultPiCommand());
       assert.equal(ctx.config.model, "openrouter/openrouter/free");
       assert.equal(ctx.config.thinking, "off");
       assert.equal(ctx.config.fallbackModels, "");
@@ -411,4 +412,79 @@ test("pi-policy records providerTelemetry and adapter emits secret-redacted open
   assert.doesNotMatch(JSON.stringify(telemetryEvents), new RegExp(fakeKey));
   assert.doesNotMatch(JSON.stringify(telemetryEvents), /secret-token-xyz/);
 });
+
+test("bundled Pi CLI resolves openrouter/openrouter/free in zero-completion testEnvironment and pre-spawn crashes emit telemetry", async () => {
+  const bundledPi = resolveDefaultPiCommand();
+  assert.equal(existsSync(bundledPi), true, `Expected bundled Pi CLI to exist at ${bundledPi}`);
+
+  const seenUrls = [];
+  const liveAdapter = createServerAdapter({
+    minStartIntervalMs: 0,
+    fetchImpl: async (url, init) => {
+      seenUrls.push(String(url));
+      if (String(url).endsWith("/models")) {
+        return { ok: true, status: 200, json: async () => ({ data: [model, freeModel] }) };
+      }
+      if (String(url).endsWith("/key")) {
+        assert.equal(init?.headers?.Authorization, `Bearer ${fakeKey}`);
+        return { ok: true, status: 200, json: async () => ({ data: { limit_remaining: 50 } }) };
+      }
+      throw new Error(`Unexpected HTTP call during testEnvironment: ${url}`);
+    },
+  });
+
+  const firstProbe = await liveAdapter.testEnvironment({
+    config: { model: "openrouter/free", env: { OPENROUTER_API_KEY: fakeKey } },
+  });
+  assert.equal(firstProbe.status, "pass", JSON.stringify(firstProbe));
+  assert.doesNotThrow(() => assertHarnessTestPassed(firstProbe));
+
+  const secondProbe = await liveAdapter.testEnvironment({
+    config: { model: "openrouter/free", env: { OPENROUTER_API_KEY: fakeKey } },
+  });
+  assert.equal(secondProbe.status, "pass");
+  assert.equal(seenUrls.filter((u) => u.endsWith("/key")).length, 1, "Key probe must cache within TTL across agent verifications");
+  assert.equal(seenUrls.some((u) => u.includes("/chat/completions")), false, "Harness verification must burn zero free completions");
+
+  const authFailAdapter = createServerAdapter({
+    minStartIntervalMs: 0,
+    fetchImpl: async (url) => {
+      if (String(url).endsWith("/models")) {
+        return { ok: true, status: 200, json: async () => ({ data: [freeModel] }) };
+      }
+      return { ok: false, status: 401, json: async () => ({ error: "unauthorized" }) };
+    },
+  });
+  const authFail = await authFailAdapter.testEnvironment({
+    config: { model: "openrouter/free", env: { OPENROUTER_API_KEY: fakeKey } },
+  });
+  assert.equal(authFail.status, "fail");
+  assert.equal(authFail.checks[0].code, "openrouter_hello_probe_auth_required");
+
+  const crashTelemetry = [];
+  const crashLogs = [];
+  const crashAdapter = createServerAdapter({
+    fetchImpl: fetchCatalog,
+    minStartIntervalMs: 0,
+    onTelemetry: (entry) => crashTelemetry.push(entry),
+    runtime: {
+      async execute() {
+        throw new Error(`Configured Pi model is unavailable with key ${fakeKey}`);
+      },
+    },
+  });
+  const crashResult = await crashAdapter.execute({
+    runId: "run-crash-1",
+    agent: { id: "agent-crash-1", companyId: "company-crash-1" },
+    config: { model: "openrouter/free", env: { OPENROUTER_API_KEY: fakeKey } },
+    onLog: async (_stream, line) => crashLogs.push(line),
+  });
+  assert.equal(crashResult.exitCode, 1);
+  assert.equal(crashResult.errorCode, "adapter_failed");
+  assert.equal(crashTelemetry.length, 1);
+  assert.equal(crashTelemetry[0].providerRequests, 0);
+  assert.equal(crashTelemetry[0].errorCode, "adapter_failed");
+  assert.doesNotMatch(JSON.stringify({ crashResult, crashTelemetry, crashLogs }), new RegExp(fakeKey));
+});
+
 
