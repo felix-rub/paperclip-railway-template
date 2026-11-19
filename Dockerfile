@@ -28,9 +28,9 @@ COPY . .
 # Give ownership of everything to the non-root user
 RUN chown -R paperclip:paperclip /app /home/paperclip
 
-# Copy and set up entrypoint (fixes volume mount ownership at runtime)
+# Copy and set up entrypoint (fixes volume mount ownership at runtime; strip CRLF from Windows uploads)
 COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+RUN sed -i 's/\r$//' /entrypoint.sh && chmod +x /entrypoint.sh
 
 # Railway injects PORT at runtime (default 3100). GEMINI_SANDBOX=false stops the
 # Gemini CLI engine from launching its own Docker-in-Docker sandbox inside this
