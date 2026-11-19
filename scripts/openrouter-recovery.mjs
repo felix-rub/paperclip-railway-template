@@ -987,6 +987,15 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
   if (!output.recovery.includes(imported("scheduleOpenRouterRetrySweep"))) {
     output.recovery = imported("scheduleOpenRouterRetrySweep") + output.recovery;
   }
+  if (typeof output.routines === "string") {
+    output.routines = replaceOnce(output.routines,
+      "        tickScheduledTriggers: async (now = new Date(), canContinue = () => true) => {",
+      `        tickScheduledTriggers: async (now = new Date(), canContinue = () => true) => {
+            await reconcileOpenRouterControlPlane(db, sql, logger);`);
+    if (!output.routines.includes(imported("reconcileOpenRouterControlPlane"))) {
+      output.routines = imported("reconcileOpenRouterControlPlane") + output.routines;
+    }
+  }
   output.recovery = replaceOnce(output.recovery,
     '            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);',
     `            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -1303,6 +1312,7 @@ export function enforceOpenRouterRecovery(root = fileURLToPath(new URL("..", imp
     queue: join(base, "server", "dist", "services", "heartbeat", "queue.js"),
     lifecycle: join(base, "server", "dist", "modules", "agent-lifecycle", "adapters", "postgres.js"),
     runControl: join(base, "server", "dist", "services", "heartbeat", "run-control.js"),
+    routines: join(base, "server", "dist", "services", "routines.js"),
   };
   const sources = Object.fromEntries(Object.entries(files).map(([name, path]) => [name, readFileSync(path, "utf8")]));
   const patched = patchOpenRouterSources(sources);

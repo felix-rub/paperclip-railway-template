@@ -57,6 +57,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
     queue: readFileSync(new URL(`${server}heartbeat/queue.js`, import.meta.url), "utf8"),
     lifecycle: readFileSync(new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url), "utf8"),
     runControl: readFileSync(new URL(`${server}heartbeat/run-control.js`, import.meta.url), "utf8"),
+    routines: readFileSync(new URL(`${server}routines.js`, import.meta.url), "utf8"),
   };
   const patched = patchOpenRouterSources(sources);
   assert.deepEqual(patchOpenRouterSources(patched), patched);
@@ -78,6 +79,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.queue, /const claimedRuns = await withOpenRouterClaimLock\(agent, async \(\) => \{/);
   assert.match(patched.queue, /limitOpenRouterAvailableSlots\(db, agent,/);
   assert.match(patched.queue, /triggerOpenRouterQueueDrain\(\(\) => resumeQueuedRunsAfterDrain\(\), logger\)/);
+  assert.match(patched.routines, /await reconcileOpenRouterControlPlane\(db, sql, logger\)/);
   assert.match(patched.pi, /retry: \{ enabled: false, maxRetries: 0, provider: \{ maxRetries: 0 \} \}/);
   assert.match(patched.piExecute, /localSystemPromptPath/);
   assert.match(patched.piExecute, /stdin: !executionTargetIsRemote && userPrompt\.trim\(\)\.length > 0/);
