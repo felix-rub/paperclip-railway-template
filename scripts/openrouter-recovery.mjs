@@ -144,11 +144,14 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
 }
 
 function replaceOnce(source, before, after) {
-  if (source.includes(after)) return source;
-  if (source.split(before).length !== 2) {
-    throw new Error(`OpenRouter recovery patch no longer matches upstream: ${before.slice(0, 100)}`);
+  const befores = Array.isArray(before) ? before : [before];
+  const afters = Array.isArray(after) ? after : [after];
+  if (afters.some(candidate => source.includes(candidate))) return source;
+  const matchedIndex = befores.findIndex(candidate => source.split(candidate).length === 2);
+  if (matchedIndex === -1) {
+    throw new Error(`OpenRouter recovery patch no longer matches upstream: ${befores[0].slice(0, 100)}`);
   }
-  return source.replace(before, after);
+  return source.replace(befores[matchedIndex], afters[Math.min(matchedIndex, afters.length - 1)]);
 }
 
 export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
@@ -162,7 +165,7 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     'import { CONVERSATION_CONTINUATION_POLICY, hasConversationContinuationPolicy, }',
     'import { CONVERSATION_CONTINUATION_POLICY, hasConversationContinuationPolicy, historicalAdapterType, runUsedConversationAdapter, }');
   output.retries = replaceOnce(output.retries,
-    '        const now = opts?.now ?? new Date();\n        const retryReason =',
+    '        const now = opts?.now ?? new Date();',
     `        const openRouterPrevAdapter = agent.adapterType === "openrouter" ? await historicalAdapterType(db, run) : null;
         if (agent.adapterType === "openrouter" &&
             (openRouterPrevAdapter === "openrouter" ||
@@ -178,8 +181,7 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
                 }
             }
         }
-        const now = opts?.now ?? new Date();
-        const retryReason =`);
+        const now = opts?.now ?? new Date();`);
   if (!output.retries.includes(imported("openRouterRetryOptions"))) {
     output.retries = imported("openRouterRetryOptions") + output.retries;
   }
@@ -190,8 +192,8 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     'const transientRetryNotBefore = transientRecovery?.retryNotBefore ?? null;',
     'const transientRetryNotBefore = agent.adapterType === "openrouter" ? null : (transientRecovery?.retryNotBefore ?? null);');
   output.retries = replaceOnce(output.retries,
-    'const requiresIssueGate = isTransientWorkspaceGitScanCode(run.errorCode) ||',
-    'const requiresIssueGate = agent.adapterType === "openrouter" || isTransientWorkspaceGitScanCode(run.errorCode) ||');
+    '        const requiresIssueGate = ',
+    '        const requiresIssueGate = agent.adapterType === "openrouter" || ');
   output.retries = replaceOnce(output.retries,
     '        const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);',
     '        const sessionBefore = agent.adapterType === "openrouter" && openRouterPrevAdapter !== "openrouter" ? null : await resolveSessionBeforeForWakeup(agent, taskKey);');
@@ -199,8 +201,17 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     'if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {',
     'if (agent.adapterType === "openrouter" && ["failed", "timed_out", "interrupted"].includes(outcome)) {\n                await scheduleBoundedRetryForRun(livenessRun, agent);\n            }\n            else if (outcome === "failed" && isMaxTurnExhaustionRun(livenessRun)) {');
   output.completion = replaceOnce(output.completion,
-    'await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)',
-    'await (failedAgent.adapterType === "openrouter" || isTransientWorkspaceGitScanCode(livenessRun.errorCode)');
+    '            await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);\n            await releaseIssueExecutionAndPromote(livenessRun, {',
+    '            await (failureOutcome === "failed" && agent.adapterType === "openrouter" ? scheduleBoundedRetryForRun(livenessRun, agent) : scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent));\n            await releaseIssueExecutionAndPromote(livenessRun, {');
+  output.completion = replaceOnce(output.completion,
+    [
+      'await (isTransientWorkspacePreparationCode(livenessRun.errorCode)',
+      'await (isTransientWorkspaceGitScanCode(livenessRun.errorCode)',
+    ],
+    [
+      'await (failedAgent.adapterType === "openrouter" || isTransientWorkspacePreparationCode(livenessRun.errorCode)',
+      'await (failedAgent.adapterType === "openrouter" || isTransientWorkspaceGitScanCode(livenessRun.errorCode)',
+    ]);
   output.recovery = replaceOnce(output.recovery,
     'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";',
     'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";\nimport { runUsedConversationAdapter } from "../conversation-continuation.js";');
