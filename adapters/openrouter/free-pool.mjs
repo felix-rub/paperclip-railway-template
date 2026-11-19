@@ -179,11 +179,17 @@ export function createFreePool({
   fetchImpl = fetch,
   log = entry => console.log(JSON.stringify(entry)),
   now = () => Date.now(),
+  sleep = (ms, signal) => new Promise((resolve) => {
+    const timer = setTimeout(done, ms);
+    function done() { clearTimeout(timer); signal?.removeEventListener("abort", done); resolve(); }
+    signal?.addEventListener("abort", done, { once: true });
+  }),
 } = {}) {
   const geminiKey = (env.GEMINI_API_KEY || env.GOOGLE_API_KEY || "").trim();
   const geminiModels = parseList(env.FREE_POOL_GEMINI_MODELS, DEFAULT_GEMINI_FREE_MODELS);
   const tierProbeModels = parseList(env.FREE_POOL_GEMINI_TIER_PROBE_MODELS, DEFAULT_TIER_PROBE_MODELS);
   const headerTimeoutMs = positiveMs(env.FREE_POOL_HEADER_TIMEOUT_MS, 90_000);
+  const maxWaitMs = env.FREE_POOL_MAX_WAIT_MS === "0" ? 0 : positiveMs(env.FREE_POOL_MAX_WAIT_MS, 150_000);
   const lanes = [
     ...(geminiKey && env.FREE_POOL_GEMINI !== "0"
       ? geminiModels.map(model => ({ id: `gemini/${model}`, provider: "gemini", model })) : []),
@@ -317,6 +323,8 @@ export function createFreePool({
     if (geminiKey && tier.state !== "free") await verifyGeminiTier();
     const attempted = [];
     let lastFailure = null;
+    const waitDeadline = now() + maxWaitMs;
+    for (;;) {
     for (const lane of availableLanes(grant.lane)) {
       if (clientAbort.signal.aborted) return res.end();
       const started = now();
@@ -388,6 +396,14 @@ export function createFreePool({
       emit({ event: "request", runId: grant.runId, agentId: grant.agentId, lane: lane.id, status: 200,
         ms: now() - started, attempted });
       return undefined;
+    }
+    // Per-minute limits clear quickly; hold the request instead of failing the run
+    // (which would push it to the next hourly retry).
+    const nextFree = exhaustedUntil();
+    if (!nextFree || nextFree > waitDeadline || clientAbort.signal.aborted) break;
+    emit({ event: "waiting", runId: grant.runId, until: new Date(nextFree).toISOString() });
+    await sleep(Math.max(0, nextFree - now()) + 250, clientAbort.signal);
+    if (clientAbort.signal.aborted) return res.end();
     }
     const until = exhaustedUntil();
     const retryAt = until ? new Date(until).toISOString() : null;

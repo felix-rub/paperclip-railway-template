@@ -125,6 +125,28 @@ test("Gemini lanes stay disabled unless the key is verified as free tier", async
   }
 });
 
+test("short per-minute cooldowns are waited out instead of failing the run", async () => {
+  let clock = Date.parse("2026-05-01T10:00:00Z");
+  let first = true;
+  const { fetchImpl } = fakeUpstream({ handlers: (url) => {
+    if (url === GEMINI && first) { first = false; return new Response("{}", { status: 503 }); }
+    if (url === GEMINI) return sse([{ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }]);
+    return new Response(JSON.stringify({ error: { message: "free-models-per-day" } }), { status: 429 });
+  } });
+  const waits = [];
+  const pool = createFreePool({ env: { GEMINI_API_KEY: "g-key", FREE_POOL_GEMINI_MODELS: "m1" }, fetchImpl, log: () => {},
+    now: () => clock, sleep: async (ms) => { waits.push(ms); clock += ms; } });
+  await pool.start();
+  try {
+    const result = await post(pool, pool.issueToken({ openrouterKey: "or-key" }), request());
+    assert.equal(result.status, 200);
+    assert.equal(result.lane, "gemini/m1");
+    assert.equal(waits.length, 1);
+  } finally {
+    await pool.close();
+  }
+});
+
 test("classifies failures and sanitizes Gemini payloads", () => {
   const now = Date.parse("2026-05-01T10:00:00Z");
   const gemini = { provider: "gemini" };
