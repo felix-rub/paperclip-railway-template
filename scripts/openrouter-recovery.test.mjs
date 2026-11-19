@@ -45,7 +45,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.retries, /opts = openRouterRetryOptions/);
   assert.match(patched.retries, /openRouterPrevAdapter !== "openrouter"/);
   assert.match(patched.completion, /"failed", "timed_out", "interrupted"/);
-  assert.match(patched.recovery, /scheduleOpenRouterRetrySweep\(db, \{ \.\.\.deps, reconcileAgentLifecycle, scheduleAgentLifecycle, notifyQueuedRunDispatch \}, sql, logger\);/);
+  assert.match(patched.recovery, /scheduleOpenRouterRetrySweep\(db, \{ \.\.\.deps, resumeAgentLifecycle: \(targetDb, agentId\) => createAgentLifecycle\(targetDb\)\.resumeAgent\(agentId, "user"\), scheduleAgentLifecycle, notifyQueuedRunDispatch \}, sql, logger\);/);
   assert.doesNotMatch(patched.recovery, /await reconcileOpenRouterRetries/);
   assert.match(patched.lifecycle, /agent\.adapterType !== "openrouter"/);
   assert.match(patched.recovery, /const \[fullLatestRun\] = await db\.select\(\)\.from\(heartbeatRuns\)/);
@@ -180,7 +180,7 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
   };
   const deps = {
     async scheduleRecoveryRetry() {},
-    async reconcileAgentLifecycle(_db, id) { reconciledAgents.push(id); },
+    async resumeAgentLifecycle(_db, id) { reconciledAgents.push(id); },
     async scheduleAgentLifecycle(_db, id) { scheduledLifecycles.push(id); },
     async notifyQueuedRunDispatch() { notifiedQueue += 1; },
   };
@@ -200,5 +200,37 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
 
   const second = await reconcileOpenRouterRetries(fakeDb, deps, sqlTag, logger);
   assert.equal(second.unparkedAgents, 0, "Boot retryAt force-unpark runs once per DB process");
+});
+
+test("all patched Paperclip server modules resolve valid named ESM exports", async () => {
+  const targets = {
+    retries: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/retries.js", import.meta.url),
+    completion: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/run-completion.js", import.meta.url),
+    recovery: new URL("../node_modules/@paperclipai/server/dist/services/recovery/service.js", import.meta.url),
+    pi: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/runtime-config.js", import.meta.url),
+    piExecute: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/execute.js", import.meta.url),
+    conversation: new URL("../node_modules/@paperclipai/server/dist/services/conversation-continuation.js", import.meta.url),
+    queue: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/queue.js", import.meta.url),
+    lifecycle: new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url),
+  };
+  const sources = Object.fromEntries(Object.entries(targets).map(([k, url]) => [k, readFileSync(url, "utf8")]));
+  const patched = patchOpenRouterSources(sources);
+  const importRegex = /import\s+\{([^}]+)\}\s+from\s+"([^"]+)";/g;
+
+  for (const [key, code] of Object.entries(patched)) {
+    const baseUrl = targets[key];
+    for (const match of code.matchAll(importRegex)) {
+      const names = match[1]
+        .split(",")
+        .map((part) => part.trim().split(/\s+as\s+/)[0].trim())
+        .filter(Boolean);
+      const specifier = match[2];
+      const resolvedUrl = specifier.startsWith(".") ? new URL(specifier, baseUrl).href : specifier;
+      const mod = await import(resolvedUrl);
+      for (const name of names) {
+        assert.ok(name in mod, `Missing export '${name}' from '${specifier}' in patched '${key}'`);
+      }
+    }
+  }
 });
 

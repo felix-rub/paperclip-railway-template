@@ -301,7 +301,7 @@ export async function reconcileOpenRouterAgentReadiness(db, deps, sql, logger) {
   const healedAgents = Array.isArray(healedRows) ? healedRows.length : 0;
 
   let resumedAgents = 0;
-  if (typeof deps?.reconcileAgentLifecycle === "function") {
+  if (typeof deps?.resumeAgentLifecycle === "function") {
     const pausedRes = await db.execute(sql`
       select a.id
       from agents a
@@ -314,10 +314,10 @@ export async function reconcileOpenRouterAgentReadiness(db, deps, sql, logger) {
     if (Array.isArray(pausedRows)) {
       for (const row of pausedRows) {
         try {
-          await deps.reconcileAgentLifecycle(db, row.id);
+          await deps.resumeAgentLifecycle(db, row.id);
           resumedAgents += 1;
         } catch (error) {
-          logger?.error?.({ err: error, agentId: row.id }, "OpenRouter paused agent lifecycle reconcile failed");
+          logger?.error?.({ err: error, agentId: row.id }, "OpenRouter paused agent lifecycle resume failed");
         }
       }
     }
@@ -695,10 +695,10 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     'import { notifyQueuedRunDispatch, notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";');
   output.recovery = replaceOnce(output.recovery,
     'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";',
-    'import { isAgentAwaitingSetup, reconcileAgentLifecycle, scheduleAgentLifecycle } from "../../modules/agent-lifecycle/index.js";\nimport { runUsedConversationAdapter } from "../conversation-continuation.js";');
+    'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";\nimport { createAgentLifecycle, scheduleAgentLifecycle } from "../agent-lifecycle.js";\nimport { runUsedConversationAdapter } from "../conversation-continuation.js";');
   output.recovery = replaceOnce(output.recovery,
     '    async function reconcileStrandedAssignedIssues(opts) {',
-    '    async function reconcileStrandedAssignedIssues(opts) {\n        scheduleOpenRouterRetrySweep(db, { ...deps, reconcileAgentLifecycle, scheduleAgentLifecycle, notifyQueuedRunDispatch }, sql, logger);');
+    '    async function reconcileStrandedAssignedIssues(opts) {\n        scheduleOpenRouterRetrySweep(db, { ...deps, resumeAgentLifecycle: (targetDb, agentId) => createAgentLifecycle(targetDb).resumeAgent(agentId, "user"), scheduleAgentLifecycle, notifyQueuedRunDispatch }, sql, logger);');
   if (!output.recovery.includes(imported("scheduleOpenRouterRetrySweep"))) {
     output.recovery = imported("scheduleOpenRouterRetrySweep") + output.recovery;
   }
