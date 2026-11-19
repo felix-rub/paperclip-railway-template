@@ -4,6 +4,7 @@ import { test } from "node:test";
 import {
   limitOpenRouterAvailableSlots,
   openRouterRetryOptions,
+  orderQueuedAgentIds,
   patchOpenRouterSources,
   scheduleOpenRouterRetrySweep,
   triggerOpenRouterQueueDrain,
@@ -45,8 +46,14 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.completion, /"failed", "timed_out", "interrupted"/);
   assert.match(patched.recovery, /scheduleOpenRouterRetrySweep\(db, deps, sql, logger\);/);
   assert.doesNotMatch(patched.recovery, /await reconcileOpenRouterRetries/);
-  assert.match(patched.recovery, /runUsedConversationAdapter/);
-  assert.match(patched.queue, /withOpenRouterClaimLock\(agent, async \(\) => \{/);
+  assert.match(patched.recovery, /const \[fullLatestRun\] = await db\.select\(\)\.from\(heartbeatRuns\)/);
+  assert.match(patched.recovery, /runUsedConversationAdapter\(db, fullLatestRun\)/);
+  assert.doesNotMatch(patched.recovery, /runUsedConversationAdapter\(db, latestRun\)/);
+  assert.match(patched.queue, /selectDistinct\(\{ agentId: heartbeatRuns\.agentId \}\)/);
+  assert.match(patched.queue, /openRouterQueuedRunClaimableSql\(heartbeatRuns, sql\)/);
+  assert.match(patched.queue, /selectClaimableQueuedRuns\(db, agent, heartbeatRuns,/);
+  assert.match(patched.queue, /orderQueuedAgentIds\(/);
+  assert.match(patched.queue, /const claimedRuns = await withOpenRouterClaimLock\(agent, async \(\) => \{/);
   assert.match(patched.queue, /limitOpenRouterAvailableSlots\(db, agent,/);
   assert.match(patched.queue, /triggerOpenRouterQueueDrain\(\(\) => resumeQueuedRunsAfterDrain\(\), logger\)/);
   assert.match(patched.pi, /retry: \{ enabled: false, maxRetries: 0, provider: \{ maxRetries: 0 \} \}/);
@@ -129,4 +136,11 @@ test("OpenRouter global concurrency lock, slot cap, and drain coalescer prevent 
   releaseFirst();
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(drainCalls, 2);
+
+  const firstOrder = orderQueuedAgentIds(["a1", "a2", "a3", "a1"]);
+  const secondOrder = orderQueuedAgentIds(["a1", "a2", "a3"]);
+  const thirdOrder = orderQueuedAgentIds(["a1", "a2", "a3"]);
+  assert.equal(firstOrder.length, 3);
+  assert.notDeepEqual(firstOrder, secondOrder);
+  assert.notDeepEqual(secondOrder, thirdOrder);
 });

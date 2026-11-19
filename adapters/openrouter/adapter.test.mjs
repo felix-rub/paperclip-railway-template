@@ -342,3 +342,73 @@ test("start pacing spaces concurrent OpenRouter runs and honors abort signals wh
   assert.equal(starts.length, 2);
   assert.ok(starts[1] - starts[0] >= 45, `Expected paced start interval >= 45ms, got ${starts[1] - starts[0]}ms`);
 });
+
+test("pi-policy records providerTelemetry and adapter emits secret-redacted openrouter.invoke telemetry", async () => {
+  const { default: policyExtension } = await import("./pi-policy.mjs");
+
+  // No-op persistence when outcome path is omitted (e.g. testEnvironment probe)
+  const prevEnv = process.env.PAPERCLIP_OPENROUTER_POLICY;
+  try {
+    process.env.PAPERCLIP_OPENROUTER_POLICY = JSON.stringify({ compact: false });
+    const handlersNoFile = new Map();
+    policyExtension({ on: (name, fn) => handlersNoFile.set(name, fn) });
+    const routed = handlersNoFile.get("before_provider_request")({
+      payload: { model: "openrouter/free", messages: [{ role: "user", content: "probe" }] },
+    });
+    assert.equal(routed.provider.max_price.prompt, 0);
+  } finally {
+    if (prevEnv === undefined) delete process.env.PAPERCLIP_OPENROUTER_POLICY;
+    else process.env.PAPERCLIP_OPENROUTER_POLICY = prevEnv;
+  }
+
+  const telemetryEvents = [];
+  const adapter = createServerAdapter({
+    fetchImpl: fetchCatalog,
+    minStartIntervalMs: 0,
+    onTelemetry: (entry) => telemetryEvents.push(entry),
+    runtime: {
+      async execute(ctx) {
+        const prev = process.env.PAPERCLIP_OPENROUTER_POLICY;
+        try {
+          process.env.PAPERCLIP_OPENROUTER_POLICY = ctx.config.env.PAPERCLIP_OPENROUTER_POLICY;
+          const handlers = new Map();
+          policyExtension({ on: (name, fn) => handlers.set(name, fn) });
+          handlers.get("before_provider_request")({
+            payload: { model: "openrouter/free", messages: [{ role: "user", content: "hello" }] },
+          });
+          handlers.get("message_end")({
+            message: {
+              id: "gen-test-123",
+              model: "meta-llama/llama-3.3-70b-instruct:free",
+              stopReason: "error",
+              errorMessage: `Upstream rate limit for ${fakeKey} with Bearer secret-token-xyz`,
+            },
+          });
+          handlers.get("agent_end")();
+        } finally {
+          if (prev === undefined) delete process.env.PAPERCLIP_OPENROUTER_POLICY;
+          else process.env.PAPERCLIP_OPENROUTER_POLICY = prev;
+        }
+        return { exitCode: 1, errorCode: "adapter_failed", errorMessage: `Failed with ${fakeKey}` };
+      },
+    },
+  });
+
+  const execResult = await adapter.execute({
+    runId: "run-telemetry-1",
+    agent: { id: "agent-telemetry-1", companyId: "company-telemetry-1" },
+    config: { model: "openrouter/free", env: { OPENROUTER_API_KEY: fakeKey } },
+    onLog: async () => {},
+  });
+  assert.equal(execResult.exitCode, 1);
+  assert.equal(telemetryEvents.length, 1);
+  assert.equal(telemetryEvents[0].tag, "openrouter.invoke");
+  assert.equal(telemetryEvents[0].providerRequests, 1);
+  assert.equal(telemetryEvents[0].requestedModel, "openrouter/free");
+  assert.equal(telemetryEvents[0].routedModel, "meta-llama/llama-3.3-70b-instruct:free");
+  assert.equal(telemetryEvents[0].responseId, "gen-test-123");
+  assert.equal(telemetryEvents[0].stopReason, "error");
+  assert.doesNotMatch(JSON.stringify(telemetryEvents), new RegExp(fakeKey));
+  assert.doesNotMatch(JSON.stringify(telemetryEvents), /secret-token-xyz/);
+});
+

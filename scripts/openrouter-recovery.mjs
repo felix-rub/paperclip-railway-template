@@ -67,6 +67,184 @@ export function triggerOpenRouterQueueDrain(resumeFn, logger) {
   });
 }
 
+let queuedAgentCursor = 0;
+
+export function orderQueuedAgentIds(agentIds) {
+  const unique = [...new Set(agentIds)];
+  if (unique.length <= 1) return unique;
+  const offset = queuedAgentCursor % unique.length;
+  queuedAgentCursor = (queuedAgentCursor + 1) % 1_000_000;
+  return offset === 0 ? unique : [...unique.slice(offset), ...unique.slice(0, offset)];
+}
+
+export function openRouterQueuedRunClaimableSql(heartbeatRuns, sql) {
+  return sql`not exists (
+    select 1
+    from issues target_issue
+    where target_issue.company_id = ${heartbeatRuns.companyId}
+      and target_issue.id = coalesce(
+        case
+          when (${heartbeatRuns.contextSnapshot} ->> 'issueId') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+          then (${heartbeatRuns.contextSnapshot} ->> 'issueId')::uuid
+          else null
+        end,
+        ${heartbeatRuns.issueId}
+      )
+      and target_issue.assignee_agent_id = ${heartbeatRuns.agentId}
+      and coalesce(${heartbeatRuns.contextSnapshot} ->> 'wakeReason', '') <> 'source_scoped_recovery_action'
+      and (
+        (
+          target_issue.origin_kind = 'routine_execution'
+          and target_issue.origin_id is not null
+          and target_issue.hidden_at is null
+          and target_issue.status in ('backlog', 'todo', 'in_progress', 'in_review', 'blocked')
+          and exists (
+            select 1
+            from issues active_routine
+            where active_routine.company_id = target_issue.company_id
+              and active_routine.origin_kind = 'routine_execution'
+              and active_routine.origin_id = target_issue.origin_id
+              and active_routine.origin_fingerprint = target_issue.origin_fingerprint
+              and active_routine.id <> target_issue.id
+              and active_routine.hidden_at is null
+              and active_routine.execution_run_id is not null
+              and active_routine.status in ('backlog', 'todo', 'in_progress', 'in_review', 'blocked')
+          )
+        )
+        or (
+          coalesce(${heartbeatRuns.scheduledRetryReason}, '') <> 'native_provider_overloaded'
+          and target_issue.execution_run_id is not null
+          and target_issue.execution_run_id <> ${heartbeatRuns.id}
+          and exists (
+            select 1
+            from heartbeat_runs owner_run
+            where owner_run.company_id = target_issue.company_id
+              and owner_run.id = target_issue.execution_run_id
+              and owner_run.status in ('queued', 'running', 'scheduled_retry')
+          )
+        )
+      )
+  )`;
+}
+
+export async function selectClaimableQueuedRuns(db, agent, heartbeatRuns, ops) {
+  const { cutoff, and, asc, eq, gte, inArray, sql } = ops;
+  if (agent?.adapterType !== "openrouter") {
+    return db
+      .select()
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.agentId, agent.id),
+        eq(heartbeatRuns.status, "queued"),
+        cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+        openRouterQueuedRunClaimableSql(heartbeatRuns, sql),
+      ))
+      .orderBy(asc(heartbeatRuns.createdAt));
+  }
+  const cutoffFilter = cutoff ? sql`and r.created_at >= ${cutoff}` : sql``;
+  const candidateResult = await db.execute(sql`
+    with claimable as (
+      select
+        r.id,
+        r.created_at,
+        case
+          when i.id is null then 2
+          when i.status = 'in_progress' then 0
+          else 1
+        end as status_rank,
+        case i.priority
+          when 'critical' then 0
+          when 'high' then 1
+          when 'medium' then 2
+          when 'low' then 3
+          else 4
+        end as priority_rank,
+        row_number() over (
+          partition by case
+            when i.origin_kind = 'routine_execution' and i.origin_id is not null
+              then 'routine:' || i.origin_id || ':' || coalesce(i.origin_fingerprint, 'default')
+            when i.id is not null
+              and coalesce(r.context_snapshot ->> 'wakeCommentId', '') = ''
+              and jsonb_typeof(r.context_snapshot -> 'wakeCommentIds') is distinct from 'array'
+              then 'issue:' || i.id::text
+            else 'run:' || r.id::text
+          end
+          order by r.created_at asc
+        ) as group_rn
+      from heartbeat_runs r
+      left join issues i
+        on i.company_id = r.company_id
+       and i.id = coalesce(
+         case
+           when (r.context_snapshot ->> 'issueId') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+           then (r.context_snapshot ->> 'issueId')::uuid
+           else null
+         end,
+         r.issue_id
+       )
+      where r.agent_id = ${agent.id}
+        and r.company_id = ${agent.companyId}
+        and r.status = 'queued'
+        ${cutoffFilter}
+        and not (
+          i.id is not null
+          and i.assignee_agent_id = r.agent_id
+          and coalesce(r.context_snapshot ->> 'wakeReason', '') <> 'source_scoped_recovery_action'
+          and (
+            (
+              i.origin_kind = 'routine_execution'
+              and i.origin_id is not null
+              and i.hidden_at is null
+              and i.status in ('backlog', 'todo', 'in_progress', 'in_review', 'blocked')
+              and exists (
+                select 1
+                from issues active_routine
+                where active_routine.company_id = i.company_id
+                  and active_routine.origin_kind = 'routine_execution'
+                  and active_routine.origin_id = i.origin_id
+                  and active_routine.origin_fingerprint = i.origin_fingerprint
+                  and active_routine.id <> i.id
+                  and active_routine.hidden_at is null
+                  and active_routine.execution_run_id is not null
+                  and active_routine.status in ('backlog', 'todo', 'in_progress', 'in_review', 'blocked')
+              )
+            )
+            or (
+              coalesce(r.scheduled_retry_reason, '') <> 'native_provider_overloaded'
+              and i.execution_run_id is not null
+              and i.execution_run_id <> r.id
+              and exists (
+                select 1
+                from heartbeat_runs owner_run
+                where owner_run.company_id = i.company_id
+                  and owner_run.id = i.execution_run_id
+                  and owner_run.status in ('queued', 'running', 'scheduled_retry')
+              )
+            )
+          )
+        )
+    )
+    select id
+    from claimable
+    where group_rn <= 3
+    order by status_rank asc, priority_rank asc, created_at asc
+    limit 50
+  `);
+  const candidateRows = candidateResult.rows ?? candidateResult;
+  if (!Array.isArray(candidateRows) || candidateRows.length === 0) return [];
+  const candidateIds = candidateRows.map((row) => row.id).filter(Boolean);
+  if (candidateIds.length === 0) return [];
+  return db
+    .select()
+    .from(heartbeatRuns)
+    .where(and(
+      eq(heartbeatRuns.agentId, agent.id),
+      eq(heartbeatRuns.status, "queued"),
+      inArray(heartbeatRuns.id, candidateIds),
+    ))
+    .orderBy(asc(heartbeatRuns.createdAt));
+}
+
 export function openRouterRetryOptions(run, agent, options) {
   if (agent.adapterType !== "openrouter") return options;
   const now = options?.now ?? new Date();
@@ -301,8 +479,10 @@ export function scheduleOpenRouterRetrySweep(db, deps, sql, logger, opts = {}) {
 }
 
 function replaceOnce(source, before, after) {
-  const befores = Array.isArray(before) ? before : [before];
-  const afters = Array.isArray(after) ? after : [after];
+  const eol = source.includes("\r\n") ? "\r\n" : "\n";
+  const normalize = value => value.replace(/\r\n/g, "\n").replace(/\n/g, eol);
+  const befores = (Array.isArray(before) ? before : [before]).map(normalize);
+  const afters = (Array.isArray(after) ? after : [after]).map(normalize);
   if (afters.some(candidate => source.includes(candidate))) return source;
   const matchedIndex = befores.findIndex(candidate => source.split(candidate).length === 2);
   if (matchedIndex === -1) {
@@ -383,13 +563,15 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     `            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
             if (latestRun && latestRun.agentId === agentId &&
                 ["failed", "timed_out", "interrupted"].includes(latestRun.status) &&
-                (await getAgent(agentId))?.adapterType === "openrouter" &&
-                (await runUsedConversationAdapter(db, latestRun) ||
-                    latestRun.resultJson?.executionRecovery?.providerWorkStarted === false)) {
-                // The persistent hourly lane owns conversation/bootstrap failures; never
-                // escalate them or restart them via the generic 60-second continuation lane.
-                result.skipped += 1;
-                continue;
+                (await getAgent(agentId))?.adapterType === "openrouter") {
+                const [fullLatestRun] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, latestRun.id)));
+                if (fullLatestRun && (await runUsedConversationAdapter(db, fullLatestRun) ||
+                    fullLatestRun.resultJson?.executionRecovery?.providerWorkStarted === false)) {
+                    // The persistent hourly lane owns conversation/bootstrap failures; never
+                    // escalate them or restart them via the generic 60-second continuation lane.
+                    result.skipped += 1;
+                    continue;
+                }
             }`);
   const modelsWrite = 'await fs.writeFile(path.join(agentConfigDir, "models.json"), `${JSON.stringify({ providers }, null, 2)}\\n`, "utf8");';
   output.pi = replaceOnce(output.pi, modelsWrite, `${modelsWrite}
@@ -428,11 +610,125 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     '    "pi_local", "grok_local", "kimi_local", "hermes_local",',
     '    "pi_local", "grok_local", "kimi_local", "hermes_local", "openrouter",');
   output.queue = replaceOnce(output.queue,
-    '            const policy = parseHeartbeatPolicy(agent);\n            const runningCount = await countRunningRunsForAgent(agentId);\n            const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);',
-    `            return withOpenRouterClaimLock(agent, async () => {
-            const policy = parseHeartbeatPolicy(agent);
+    `        const queuedRuns = await db
+            .select({ agentId: heartbeatRuns.agentId })
+            .from(heartbeatRuns)
+            .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+            .where(and(eq(heartbeatRuns.status, "queued"), scope ? eq(heartbeatRuns.companyId, scope.companyId) : undefined, eq(companies.status, "active"), cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined));
+        const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];`,
+    `        const queuedRuns = await db
+            .selectDistinct({ agentId: heartbeatRuns.agentId })
+            .from(heartbeatRuns)
+            .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+            .where(and(eq(heartbeatRuns.status, "queued"), scope ? eq(heartbeatRuns.companyId, scope.companyId) : undefined, eq(companies.status, "active"), cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined, openRouterQueuedRunClaimableSql(heartbeatRuns, sql)));
+        const agentIds = orderQueuedAgentIds(queuedRuns.map((r) => r.agentId));`);
+  output.queue = replaceOnce(output.queue,
+    `                or coalesce(prior.continuation_attempt, 0) > 0)))
+          )\`));
+        for (const { agentId } of rows) {
+            await startNextQueuedRunForAgent(agentId);
+        }`,
+    `                or coalesce(prior.continuation_attempt, 0) > 0)))
+          )\`, openRouterQueuedRunClaimableSql(heartbeatRuns, sql)));
+        for (const agentId of orderQueuedAgentIds(rows.map((r) => r.agentId))) {
+            await startNextQueuedRunForAgent(agentId);
+        }`);
+  output.queue = replaceOnce(output.queue,
+    `            const policy = parseHeartbeatPolicy(agent);
             const runningCount = await countRunningRunsForAgent(agentId);
-            const availableSlots = await limitOpenRouterAvailableSlots(db, agent, Math.max(0, policy.maxConcurrentRuns - runningCount), sql);`);
+            const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+            if (availableSlots <= 0)
+                return [];
+            const queuedRuns = await db
+                .select()
+                .from(heartbeatRuns)
+                .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued"), cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined))
+                .orderBy(asc(heartbeatRuns.createdAt));`,
+    `            const policy = parseHeartbeatPolicy(agent);
+            const runningCount = await countRunningRunsForAgent(agentId);
+            const perAgentSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);
+            const availableSlots = await limitOpenRouterAvailableSlots(db, agent, perAgentSlots, sql);
+            if (availableSlots <= 0)
+                return [];
+            const queuedRuns = await selectClaimableQueuedRuns(db, agent, heartbeatRuns, { cutoff, and, asc, eq, gte, inArray, sql });`);
+  output.queue = replaceOnce(output.queue,
+    `            const issueRows = await db
+                .select({
+                id: issues.id,
+                status: issues.status,
+                priority: issues.priority,
+            })`,
+    `            const issueRows = await db
+                .select({
+                id: issues.id,
+                status: issues.status,
+                priority: issues.priority,
+                originKind: issues.originKind,
+                originId: issues.originId,
+                originFingerprint: issues.originFingerprint,
+            })`);
+  output.queue = replaceOnce(output.queue,
+    `            const claimedRuns = [];
+            for (const queuedRun of prioritizedRuns) {
+                if (claimedRuns.length >= availableSlots)
+                    break;
+                let claimed;
+                try {
+                    claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects, deferredCancellations);
+                }
+                catch (err) {
+                    if (isPermanentClaimRejection(err)) {
+                        rejectedClaims.push({ run: queuedRun, err });
+                        continue;
+                    }
+                    if (!isDeferrableClaimRejection(err))
+                        throw err;
+                    logger.warn({ err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId }, "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass");
+                    continue;
+                }
+                if (claimed)
+                    claimedRuns.push(claimed);
+            }`,
+    `            const claimedRuns = await withOpenRouterClaimLock(agent, async () => {
+                const lockedSlots = await limitOpenRouterAvailableSlots(db, agent, Math.max(0, policy.maxConcurrentRuns - await countRunningRunsForAgent(agentId)), sql);
+                if (lockedSlots <= 0)
+                    return [];
+                const batch = [];
+                const skippedRoutineKeys = new Set();
+                for (const queuedRun of prioritizedRuns) {
+                    if (batch.length >= lockedSlots)
+                        break;
+                    const runIssueId = readNonEmptyString(parseObject(queuedRun.contextSnapshot).issueId);
+                    const runIssue = runIssueId ? issueById.get(runIssueId) : null;
+                    const routineKey = runIssue?.originKind === "routine_execution" && runIssue.originId
+                        ? \`\${runIssue.originId}:\${runIssue.originFingerprint ?? "default"}\`
+                        : null;
+                    if (routineKey && skippedRoutineKeys.has(routineKey))
+                        continue;
+                    let claimed;
+                    try {
+                        claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects, deferredCancellations);
+                    }
+                    catch (err) {
+                        if (isPermanentClaimRejection(err)) {
+                            rejectedClaims.push({ run: queuedRun, err });
+                            continue;
+                        }
+                        if (!isDeferrableClaimRejection(err))
+                            throw err;
+                        if (routineKey && err.status === 409)
+                            skippedRoutineKeys.add(routineKey);
+                        logger.warn({ err, runId: queuedRun.id, agentId: queuedRun.agentId, companyId: queuedRun.companyId }, "queued heartbeat run claim was rejected; leaving it queued for the next recovery pass");
+                        continue;
+                    }
+                    if (claimed) {
+                        batch.push(claimed);
+                        if (routineKey)
+                            skippedRoutineKeys.add(routineKey);
+                    }
+                }
+                return batch;
+            });`);
   output.queue = replaceOnce(output.queue,
     `                void execution.finally(() => {
                     // drainActiveRunExecutions loops on activeRunExecutionPromises.size,
@@ -452,7 +748,6 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
                 });
             }
             return claimedRuns;
-            });
         }).finally(async () => {`);
   output.queue = replaceOnce(output.queue,
     '        if (policy.skipTimerWhenNoActionableWork &&',
@@ -464,7 +759,7 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
             return null;
         }
         if (policy.skipTimerWhenNoActionableWork &&`);
-  const queueImports = imported("hasOpenRouterHourlyWait, limitOpenRouterAvailableSlots, triggerOpenRouterQueueDrain, withOpenRouterClaimLock");
+  const queueImports = imported("hasOpenRouterHourlyWait, limitOpenRouterAvailableSlots, openRouterQueuedRunClaimableSql, orderQueuedAgentIds, selectClaimableQueuedRuns, triggerOpenRouterQueueDrain, withOpenRouterClaimLock");
   if (!output.queue.includes(queueImports)) {
     output.queue = queueImports + output.queue;
   }

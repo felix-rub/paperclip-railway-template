@@ -1,18 +1,35 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { test } from "node:test";
-import { and, eq, sql } from "drizzle-orm";
+import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
 import {
-  activityLog, agents, agentWakeupRequests, companies, heartbeatRuns, issues,
+  activityLog, agents, agentWakeupRequests, companies, heartbeatRunEvents, heartbeatRuns, issues,
   applyPendingMigrations, closeRegisteredClients, createDb,
 } from "@paperclipai/db";
 import {
   enforceOpenRouterRecovery,
   hasOpenRouterHourlyWait,
   limitOpenRouterAvailableSlots,
+  openRouterQueuedRunClaimableSql,
   reconcileOpenRouterRetries,
+  selectClaimableQueuedRuns,
   OPENROUTER_RETRY_MS,
 } from "./openrouter-recovery.mjs";
+
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
+const PATCHED_MODULE_PATHS = [
+  join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "heartbeat", "retries.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "heartbeat", "run-completion.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "recovery", "service.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "adapter-pi-local", "dist", "server", "runtime-config.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "adapter-pi-local", "dist", "server", "execute.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "conversation-continuation.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "heartbeat", "queue.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "modules", "agent-lifecycle", "adapters", "postgres.js"),
+];
 
 test("durable hourly recovery survives restarts, exhausted budgets and concurrent schedulers", {
   skip: !process.env.OPENROUTER_TEST_DATABASE_URL, timeout: 120_000,
@@ -22,6 +39,7 @@ test("durable hourly recovery survives restarts, exhausted budgets and concurren
   assert.ok(["localhost", "127.0.0.1"].includes(parsed.hostname), "Test database must be local and disposable.");
   assert.equal(parsed.pathname, "/openrouter_retry_test");
   await applyPendingMigrations(url);
+  const originalModuleSnapshots = new Map(PATCHED_MODULE_PATHS.map(p => [p, readFileSync(p, "utf8")]));
   enforceOpenRouterRecovery();
   const { createHeartbeatRetries } = await import("../node_modules/@paperclipai/server/dist/services/heartbeat/retries.js");
   const { createRunDispatch } = await import("../node_modules/@paperclipai/server/dist/modules/run-dispatch/index.js");
@@ -239,7 +257,98 @@ test("durable hourly recovery survives restarts, exhausted budgets and concurren
     assert.ok(runningA && runningB);
     assert.equal(await limitOpenRouterAvailableSlots(db, candidateOr.agent, 2, sql, {}), 0);
     assert.equal(await limitOpenRouterAvailableSlots(db, other.agent, 2, sql, {}), 2);
+
+    // Routine-blocked queued runs are filtered out in Postgres (preventing 409 queue spins),
+    // and unblocked routine backlogs are capped to <= 3 candidates per routine.
+    const routineId = randomUUID();
+    const routineCompanyId = randomUUID();
+    await db.insert(companies).values({
+      id: routineCompanyId, name: "Routine spin guard", status: "active", issuePrefix: `Q${routineCompanyId.slice(0, 7)}`,
+    });
+    const [routineAgent] = await db.insert(agents).values({
+      companyId: routineCompanyId, name: "Routine Agent", adapterType: "openrouter", status: "active",
+      adapterConfig: { model: "openrouter/free" },
+    }).returning();
+    const [activeRoutineIssue] = await db.insert(issues).values({
+      companyId: routineCompanyId, title: "Active routine execution", status: "todo",
+      assigneeAgentId: routineAgent.id, originKind: "routine_execution", originId: routineId, originFingerprint: "default",
+    }).returning();
+    const [activeRoutineRun] = await db.insert(heartbeatRuns).values({
+      companyId: routineCompanyId, agentId: routineAgent.id, scopeKind: "issue", issueId: activeRoutineIssue.id,
+      status: "scheduled_retry", scheduledRetryAt: new Date(+now + OPENROUTER_RETRY_MS),
+      contextSnapshot: { issueId: activeRoutineIssue.id },
+    }).returning();
+    await db.update(issues).set({ executionRunId: activeRoutineRun.id }).where(eq(issues.id, activeRoutineIssue.id));
+
+    const blockedIssues = await db.insert(issues).values(
+      Array.from({ length: 12 }, (_, idx) => ({
+        companyId: routineCompanyId,
+        title: `Queued routine ${idx}`,
+        status: "todo",
+        assigneeAgentId: routineAgent.id,
+        originKind: "routine_execution",
+        originId: routineId,
+        originFingerprint: "default",
+      })),
+    ).returning();
+    await db.insert(heartbeatRuns).values(
+      blockedIssues.map((bi, idx) => ({
+        companyId: routineCompanyId,
+        agentId: routineAgent.id,
+        scopeKind: "issue",
+        issueId: null,
+        status: "queued",
+        createdAt: new Date(+now + idx * 100),
+        contextSnapshot: { issueId: bi.id },
+      })),
+    );
+
+    const distinctBlockedAgents = await db
+      .selectDistinct({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, routineCompanyId),
+        eq(heartbeatRuns.status, "queued"),
+        openRouterQueuedRunClaimableSql(heartbeatRuns, sql),
+      ));
+    assert.deepEqual(distinctBlockedAgents, [], "Routine-blocked queued runs must not wake dispatch");
+    const blockedCandidates = await selectClaimableQueuedRuns(db, routineAgent, heartbeatRuns, {
+      cutoff: null, and, asc, eq, gte, inArray, sql,
+    });
+    assert.equal(blockedCandidates.length, 0, "Routine-blocked queued runs must return 0 candidates");
+
+    // Once the active routine finishes, selectClaimableQueuedRuns caps the routine group to <= 3 oldest runs.
+    await db.update(issues).set({ status: "done", executionRunId: null }).where(eq(issues.id, activeRoutineIssue.id));
+    const unblockedCandidates = await selectClaimableQueuedRuns(db, routineAgent, heartbeatRuns, {
+      cutoff: null, and, asc, eq, gte, inArray, sql,
+    });
+    assert.equal(unblockedCandidates.length, 3, "Unblocked routine backlog must cap at 3 candidates per routine");
+    assert.equal(unblockedCandidates[0].contextSnapshot.issueId, blockedIssues[0].id);
+
+    // Partial latestRun rows (without companyId / runnerProfileJson) in recovery service never crash runUsedConversationAdapter.
+    const { runUsedConversationAdapter } = await import("../node_modules/@paperclipai/server/dist/services/conversation-continuation.js");
+    const [strandedIssue] = await db.insert(issues).values({
+      companyId: routineCompanyId, title: "Stranded historical event issue", status: "in_progress",
+      assigneeAgentId: routineAgent.id,
+    }).returning();
+    const [historicalRun] = await db.insert(heartbeatRuns).values({
+      companyId: routineCompanyId, agentId: routineAgent.id, scopeKind: "issue", issueId: strandedIssue.id,
+      status: "failed", finishedAt: now, runnerProfileJson: null, resultJson: {},
+      contextSnapshot: { issueId: strandedIssue.id },
+    }).returning();
+    await db.insert(heartbeatRunEvents).values({
+      companyId: routineCompanyId, runId: historicalRun.id, agentId: routineAgent.id,
+      seq: 1, eventType: "adapter.invoke", payload: { adapterType: "openrouter" },
+    });
+    const [fullLatestRun] = await db.select().from(heartbeatRuns).where(and(
+      eq(heartbeatRuns.companyId, strandedIssue.companyId),
+      eq(heartbeatRuns.id, historicalRun.id),
+    ));
+    assert.equal(await runUsedConversationAdapter(db, fullLatestRun), true);
   } finally {
     await closeRegisteredClients(url);
+    for (const [modulePath, content] of originalModuleSnapshots) {
+      writeFileSync(modulePath, content, "utf8");
+    }
   }
 });

@@ -112,10 +112,22 @@ function resolveMinStartIntervalMs(explicitMs, isDefaultFetch, env = process.env
   return isDefaultFetch ? DEFAULT_PRODUCTION_START_INTERVAL_MS : 0;
 }
 
-export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, minStartIntervalMs } = {}) {
+function redactSecrets(value, extraSecret = "") {
+  if (typeof value !== "string" || !value) return null;
+  let out = value
+    .replace(/sk-or-v1-[a-zA-Z0-9_-]+/g, "[REDACTED]")
+    .replace(/Bearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED]");
+  if (typeof extraSecret === "string" && extraSecret.trim().length >= 8) {
+    out = out.split(extraSecret.trim()).join("[REDACTED]");
+  }
+  return out.slice(0, 300);
+}
+
+export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, minStartIntervalMs, onTelemetry } = {}) {
   const catalog = createCatalog(fetchImpl);
   const isDefaultFetch = fetchImpl === fetch;
   const waitForStartSlot = minStartIntervalMs === undefined ? sharedStartPacer : createStartPacer();
+  const emitTelemetry = typeof onTelemetry === "function" ? onTelemetry : (entry) => console.log(JSON.stringify(entry));
   async function prepareConfig(config) {
     if ((Array.isArray(config.extraArgs) && config.extraArgs.length) ||
         (Array.isArray(config.args) && config.args.length)) {
@@ -205,23 +217,60 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
         };
       }
       const result = await runtime.execute({ ...ctx, config: attempt });
-      if (!policy.compact) return { result, state: {} };
-      let state;
+      let state = null;
       try {
         state = JSON.parse(await readFile(outcome, "utf8"));
       } catch (error) {
         if (error.code !== "ENOENT") throw error;
-        return { result: result.exitCode === 0 ? failResult("openrouter_policy_unavailable", "Compact policy did not initialize.", result) : result, state: {} };
+      }
+      const recordInvokeTelemetry = (finalResult) => {
+        const providerTelemetry = state?.providerTelemetry ?? null;
+        try {
+          emitTelemetry({
+            tag: "openrouter.invoke",
+            runId: ctx.runId ?? null,
+            agentId: ctx.agent?.id ?? null,
+            companyId: ctx.agent?.companyId ?? null,
+            profile: policy.compact ? "compact" : "standard",
+            providerRequests: Number(providerTelemetry?.requestsSent ?? 0),
+            requestedModel: providerTelemetry?.requestedModel ?? config.model ?? null,
+            routedModel: finalResult?.provider || providerTelemetry?.lastModel || null,
+            exitCode: finalResult?.exitCode ?? null,
+            timedOut: Boolean(finalResult?.timedOut),
+            errorCode: finalResult?.errorCode ?? null,
+            stopReason: providerTelemetry?.lastStopReason ?? null,
+            responseId: providerTelemetry?.responseId ?? null,
+            lastError: redactSecrets(providerTelemetry?.lastError ?? finalResult?.errorMessage ?? null, config.env?.OPENROUTER_API_KEY),
+          });
+        } catch {
+          // Never fail execution due to telemetry logging.
+        }
+      };
+      if (!policy.compact) {
+        recordInvokeTelemetry(result);
+        return { result, state: state ?? {} };
+      }
+      if (!state) {
+        const failed = result.exitCode === 0 ? failResult("openrouter_policy_unavailable", "Compact policy did not initialize.", result) : result;
+        recordInvokeTelemetry(failed);
+        return { result: failed, state: {} };
       }
       if (state.terminal && !result.timedOut && !result.signal) {
-        return { result: { ...result, exitCode: 0, errorCode: null, errorMessage: null, summary: "" }, state };
+        const okResult = { ...result, exitCode: 0, errorCode: null, errorMessage: null, summary: "" };
+        recordInvokeTelemetry(okResult);
+        return { result: okResult, state };
       }
       if (state.stop) {
-        return { result: failResult(state.stop, "OpenRouter compact policy stopped this run before any further work.", result), state };
+        const stopped = failResult(state.stop, "OpenRouter compact policy stopped this run before any further work.", result);
+        recordInvokeTelemetry(stopped);
+        return { result: stopped, state };
       }
       if (result.exitCode === 0) {
-        return { result: failResult("openrouter_issue_unfinished", "Model exited without recording a verified issue outcome.", result), state };
+        const unfinished = failResult("openrouter_issue_unfinished", "Model exited without recording a verified issue outcome.", result);
+        recordInvokeTelemetry(unfinished);
+        return { result: unfinished, state };
       }
+      recordInvokeTelemetry(result);
       return { result, state };
     } finally {
       await rm(dir, { recursive: true, force: true });
