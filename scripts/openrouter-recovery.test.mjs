@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
@@ -36,6 +37,8 @@ test("patch matches installed upstream, installs every hook, and remains idempot
     recovery: readFileSync(new URL(`${server}recovery/service.js`, import.meta.url), "utf8"),
     pi: readFileSync(new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/runtime-config.js", import.meta.url), "utf8"),
     piExecute: readFileSync(new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/execute.js", import.meta.url), "utf8"),
+    piModels: readFileSync(new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/models.js", import.meta.url), "utf8"),
+    piMain: readFileSync(new URL("../node_modules/@earendil-works/pi-coding-agent/dist/main.js", import.meta.url), "utf8"),
     conversation: readFileSync(new URL(`${server}conversation-continuation.js`, import.meta.url), "utf8"),
     queue: readFileSync(new URL(`${server}heartbeat/queue.js`, import.meta.url), "utf8"),
     lifecycle: readFileSync(new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url), "utf8"),
@@ -61,6 +64,11 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.pi, /retry: \{ enabled: false, maxRetries: 0, provider: \{ maxRetries: 0 \} \}/);
   assert.match(patched.piExecute, /localSystemPromptPath/);
   assert.match(patched.piExecute, /stdin: !executionTargetIsRemote && userPrompt\.trim\(\)\.length > 0/);
+  assert.match(patched.piExecute, /runtimeEnv\.PAPERCLIP_OPENROUTER_FREE_ONLY !== "1"/);
+  assert.match(patched.piModels, /const stdoutModels = parseModelsOutput\(result\.stdout\)/);
+  assert.match(patched.piModels, /searchPattern: slashIndex > 0 \? `\$\{model\.slice\(0, slashIndex\)\} \$\{model\.slice\(slashIndex \+ 1\)\}` : model/);
+  assert.match(patched.piMain, /await flushStream\(process\.stdout\)/);
+  assert.match(patched.piMain, /await flushStream\(process\.stderr\)/);
   const changed = { ...sources, retries: "unexpected upstream implementation" };
   assert.throws(() => patchOpenRouterSources(changed), /no longer matches upstream/);
   assert.equal(changed.retries, "unexpected upstream implementation");
@@ -154,6 +162,9 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
   const infoLogs = [];
   const sqlTag = (strings, ...values) => ({ text: strings.join("?"), values });
   const fakeDb = {
+    async transaction(fn) {
+      return fn({ isTransaction: true });
+    },
     async execute(query) {
       if (query.text.includes("set status = 'idle'")) return { rows: [{ id: "agent-healed-1" }] };
       if (query.text.includes("and a.lifecycle_state = 'paused'")) return { rows: [{ id: "agent-paused-1" }] };
@@ -182,7 +193,12 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
     async scheduleRecoveryRetry() {},
     async resumeAgentLifecycle(_db, id) { reconciledAgents.push(id); },
     async scheduleAgentLifecycle(_db, id) { scheduledLifecycles.push(id); },
-    async notifyQueuedRunDispatch() { notifiedQueue += 1; },
+    async notifyQueuedRunDispatch(tx) {
+      if (!tx?.isTransaction) {
+        throw new Error("Database work must be registered inside a transaction");
+      }
+      notifiedQueue += 1;
+    },
   };
   const logger = {
     info(payload, msg) { infoLogs.push({ payload, msg }); },
@@ -209,6 +225,8 @@ test("all patched Paperclip server modules resolve valid named ESM exports", asy
     recovery: new URL("../node_modules/@paperclipai/server/dist/services/recovery/service.js", import.meta.url),
     pi: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/runtime-config.js", import.meta.url),
     piExecute: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/execute.js", import.meta.url),
+    piModels: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/models.js", import.meta.url),
+    piMain: new URL("../node_modules/@earendil-works/pi-coding-agent/dist/main.js", import.meta.url),
     conversation: new URL("../node_modules/@paperclipai/server/dist/services/conversation-continuation.js", import.meta.url),
     queue: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/queue.js", import.meta.url),
     lifecycle: new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url),
@@ -218,6 +236,17 @@ test("all patched Paperclip server modules resolve valid named ESM exports", asy
   const importRegex = /import\s+\{([^}]+)\}\s+from\s+"([^"]+)";/g;
 
   for (const [key, code] of Object.entries(patched)) {
+    execFileSync(process.execPath, ["--input-type=module", "--check"], {
+      input: code.replace(/^#!.*\r?\n/, ""),
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    if (key === "piMain") {
+      assert.deepEqual(
+        [...code.matchAll(importRegex)].map((m) => m[0]),
+        [...sources.piMain.matchAll(importRegex)].map((m) => m[0]),
+      );
+      continue;
+    }
     const baseUrl = targets[key];
     for (const match of code.matchAll(importRegex)) {
       const names = match[1]
@@ -231,6 +260,99 @@ test("all patched Paperclip server modules resolve valid named ESM exports", asy
         assert.ok(name in mod, `Missing export '${name}' from '${specifier}' in patched '${key}'`);
       }
     }
+  }
+});
+
+test("patched piModels recovers from truncated full discovery and stderr warnings via targeted fallback", async () => {
+  const targets = {
+    retries: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/retries.js", import.meta.url),
+    completion: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/run-completion.js", import.meta.url),
+    recovery: new URL("../node_modules/@paperclipai/server/dist/services/recovery/service.js", import.meta.url),
+    pi: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/runtime-config.js", import.meta.url),
+    piExecute: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/execute.js", import.meta.url),
+    piModels: new URL("../node_modules/@paperclipai/adapter-pi-local/dist/server/models.js", import.meta.url),
+    piMain: new URL("../node_modules/@earendil-works/pi-coding-agent/dist/main.js", import.meta.url),
+    conversation: new URL("../node_modules/@paperclipai/server/dist/services/conversation-continuation.js", import.meta.url),
+    queue: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/queue.js", import.meta.url),
+    lifecycle: new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url),
+  };
+  const sources = Object.fromEntries(Object.entries(targets).map(([k, url]) => [k, readFileSync(url, "utf8")]));
+  const patched = patchOpenRouterSources(sources);
+
+  const calls = [];
+  globalThis.__openRouterPiModelsStub = async (_runId, _cmd, args) => {
+    calls.push(args);
+    if (args.length === 1 && args[0] === "--list-models") {
+      const truncatedRows = Array.from(
+        { length: 194 },
+        (_, i) => `anthropic   claude-model-${i}   200k   8k   yes   yes`,
+      ).join("\n");
+      return {
+        exitCode: 0,
+        timedOut: false,
+        stdout: "",
+        stderr: `Warning: model registry warning\nprovider   model   context   max-out   thinking   images\n${truncatedRows}\n`,
+      };
+    }
+    if (args[1] === "openrouter openrouter/free") {
+      return {
+        exitCode: 0,
+        timedOut: false,
+        stdout:
+          "provider     model             context   max-out   thinking   images\nopenrouter   openrouter/free   128k      4k        no         no\n",
+        stderr: "ExperimentalWarning: fake stderr warning",
+      };
+    }
+    return {
+      exitCode: 0,
+      timedOut: false,
+      stdout: "No models matching \"missing/model\"\n",
+      stderr: "",
+    };
+  };
+
+  const instrumentedCode = patched.piModels.replace(
+    'import { asString, runChildProcess, sanitizeInheritedPaperclipEnv } from "@paperclipai/adapter-utils/server-utils";',
+    [
+      "const asString = (v, fallback) => (typeof v === 'string' && v.trim().length > 0 ? v.trim() : fallback);",
+      "const sanitizeInheritedPaperclipEnv = (env) => ({ ...env });",
+      "const runChildProcess = (...args) => globalThis.__openRouterPiModelsStub(...args);",
+    ].join("\n"),
+  );
+  const mod = await import(`data:text/javascript;base64,${Buffer.from(instrumentedCode, "utf8").toString("base64")}`);
+  try {
+    await mod.ensurePiModelConfiguredAndAvailable({
+      model: "openrouter/openrouter/free",
+      command: "pi",
+      cwd: "/tmp",
+      env: { OPENROUTER_API_KEY: "sk-test" },
+    });
+    assert.deepEqual(calls, [
+      ["--list-models"],
+      ["--list-models", "openrouter openrouter/free"],
+    ]);
+
+    // Second call hits healed cache without spawning another subprocess.
+    await mod.ensurePiModelConfiguredAndAvailable({
+      model: "openrouter/openrouter/free",
+      command: "pi",
+      cwd: "/tmp",
+      env: { OPENROUTER_API_KEY: "sk-test" },
+    });
+    assert.equal(calls.length, 2);
+
+    await assert.rejects(
+      () =>
+        mod.ensurePiModelConfiguredAndAvailable({
+          model: "openrouter/missing-model",
+          command: "pi",
+          cwd: "/tmp",
+          env: { OPENROUTER_API_KEY: "sk-test" },
+        }),
+      /Configured Pi model is unavailable: openrouter\/missing-model/,
+    );
+  } finally {
+    delete globalThis.__openRouterPiModelsStub;
   }
 });
 

@@ -548,8 +548,14 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {
       const runningRuns = Number(summaryRow.running_runs ?? 0);
       const queuedRuns = Number(summaryRow.queued_runs ?? 0);
       const scheduledRetryRuns = Number(summaryRow.scheduled_retry_runs ?? 0);
-      if (readyAgents > 0 && queuedRuns > 0 && runningRuns < resolveOpenRouterMaxConcurrentRuns()) {
-        await deps.notifyQueuedRunDispatch?.(db);
+      if (readyAgents > 0 && queuedRuns > 0 && runningRuns < resolveOpenRouterMaxConcurrentRuns() && typeof deps.notifyQueuedRunDispatch === "function") {
+        if (typeof db.transaction === "function") {
+          await db.transaction(async (tx) => {
+            await deps.notifyQueuedRunDispatch(tx);
+          });
+        } else {
+          await deps.notifyQueuedRunDispatch(db);
+        }
       }
       const now = Date.now();
       const lastLoggedAt = stateLogTimestamps.get(db) ?? 0;
@@ -748,8 +754,60 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     '                env: executionTargetIsRemote ? env : runtimeEnv,',
     '                env: executionTargetIsRemote ? env : runtimeEnv,\n                stdin: !executionTargetIsRemote && userPrompt.trim().length > 0 ? userPrompt : undefined,');
   output.piExecute = replaceOnce(output.piExecute,
+    '        if (!executionTargetIsRemote) {\n            await ensurePiModelConfiguredAndAvailable({',
+    '        if (!executionTargetIsRemote && runtimeEnv.PAPERCLIP_OPENROUTER_FREE_ONLY !== "1") {\n            await ensurePiModelConfiguredAndAvailable({');
+  output.piExecute = replaceOnce(output.piExecute,
     '        await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup()]);',
     '        await Promise.all([preparedRuntimeConfig.cleanup(), attributionExtension?.cleanup(), localSystemPromptDir ? fs.rm(localSystemPromptDir, { recursive: true, force: true }).catch(() => undefined) : Promise.resolve()]);');
+  if (typeof output.piModels === "string") {
+    output.piModels = replaceOnce(output.piModels,
+      '    const result = await runChildProcess(`pi-models-${Date.now()}-${Math.random().toString(16).slice(2)}`, command, ["--list-models"], {',
+      '    const listArgs = typeof input.searchPattern === "string" && input.searchPattern.trim().length > 0 ? ["--list-models", input.searchPattern.trim()] : ["--list-models"];\n    const result = await runChildProcess(`pi-models-${Date.now()}-${Math.random().toString(16).slice(2)}`, command, listArgs, {');
+    output.piModels = replaceOnce(output.piModels,
+      '    // Pi outputs model list to stderr, but fall back to stdout for older versions\n    const output = result.stderr || result.stdout;\n    return sortModels(dedupeModels(parseModelsOutput(output)));',
+      '    const stdoutModels = parseModelsOutput(result.stdout);\n    const parsedModels = stdoutModels.length > 0 ? stdoutModels : parseModelsOutput(result.stderr);\n    return sortModels(dedupeModels(parsedModels));');
+    output.piModels = replaceOnce(output.piModels,
+      '    if (!models.some((entry) => entry.id === model)) {\n        throw new Error(`Configured Pi model is unavailable: ${model}. ${models.length} models are available; list them with \\`pi --list-models\\`.`);\n    }',
+      `    if (!models.some((entry) => entry.id === model)) {
+        const slashIndex = model.indexOf("/");
+        const targeted = await discoverPiModels({
+            command: input.command,
+            cwd: input.cwd,
+            env: input.env,
+            searchPattern: slashIndex > 0 ? \`\${model.slice(0, slashIndex)} \${model.slice(slashIndex + 1)}\` : model,
+        });
+        if (!targeted.some((entry) => entry.id === model)) {
+            throw new Error(\`Configured Pi model is unavailable: \${model}. \${models.length} models are available; list them with \\\`pi --list-models\\\`.\`);
+        }
+        const merged = sortModels(dedupeModels([...models, ...targeted]));
+        const cacheKey = discoveryCacheKey(resolvePiCommand(input.command), asString(input.cwd, process.cwd()), normalizeEnv(input.env));
+        discoveryCache.set(cacheKey, { expiresAt: Date.now() + MODELS_CACHE_TTL_MS, models: merged });
+        return merged;
+    }`);
+  }
+  if (typeof output.piMain === "string") {
+    output.piMain = replaceOnce(output.piMain,
+      `    if (parsed.listModels !== undefined) {
+        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
+        await listModels(modelRegistry, searchPattern);
+        process.exit(0);
+    }`,
+      `    if (parsed.listModels !== undefined) {
+        const searchPattern = typeof parsed.listModels === "string" ? parsed.listModels : undefined;
+        await listModels(modelRegistry, searchPattern);
+        restoreStdout();
+        const flushStream = (stream) => stream.destroyed || stream.writableEnded
+            ? Promise.resolve()
+            : new Promise((resolve) => {
+                const done = () => resolve();
+                stream.once("error", done);
+                stream.write("", done);
+            });
+        await flushStream(process.stdout);
+        await flushStream(process.stderr);
+        process.exit(0);
+    }`);
+  }
   output.conversation = replaceOnce(output.conversation,
     '    "pi_local", "grok_local", "kimi_local", "hermes_local",',
     '    "pi_local", "grok_local", "kimi_local", "hermes_local", "openrouter",');
@@ -924,6 +982,8 @@ export function enforceOpenRouterRecovery(root = fileURLToPath(new URL("..", imp
     recovery: join(base, "server", "dist", "services", "recovery", "service.js"),
     pi: join(base, "adapter-pi-local", "dist", "server", "runtime-config.js"),
     piExecute: join(base, "adapter-pi-local", "dist", "server", "execute.js"),
+    piModels: join(base, "adapter-pi-local", "dist", "server", "models.js"),
+    piMain: join(root, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "main.js"),
     conversation: join(base, "server", "dist", "services", "conversation-continuation.js"),
     queue: join(base, "server", "dist", "services", "heartbeat", "queue.js"),
     lifecycle: join(base, "server", "dist", "modules", "agent-lifecycle", "adapters", "postgres.js"),

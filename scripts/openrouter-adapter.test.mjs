@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { registerOpenRouterAdapter } from "./openrouter-adapter.mjs";
+import { registerOpenRouterAdapter, repairShadowedPiBinary } from "./openrouter-adapter.mjs";
 
 function fixture(run) {
   const root = mkdtempSync(join(tmpdir(), "paperclip-openrouter-"));
@@ -59,4 +59,27 @@ test("existing Pi sessions are never overwritten", () => fixture(options => {
   assert.throws(() => registerOpenRouterAdapter(options), /already exists outside/);
   assert.equal(readFileSync(join(sessions, "existing-session"), "utf8"), "keep");
   assert.equal(existsSync(join(options.home, "adapter-plugins.json")), false);
+}));
+
+test("repairShadowedPiBinary replaces stale volume .local/bin/pi without creating unwanted links", () => fixture(options => {
+  const bundledPi = join(options.packageDir, "bundled-pi.mjs");
+  writeFileSync(bundledPi, "#!/usr/bin/env node\n");
+  assert.equal(repairShadowedPiBinary({
+    dirs: [options.home, options.userHome],
+    bundledPiPath: bundledPi,
+    platform: "linux",
+    linkFn: (target, linkPath) => writeFileSync(linkPath, target, "utf8"),
+  }), 0);
+  assert.equal(existsSync(join(options.home, ".local", "bin", "pi")), false);
+
+  const stalePiDir = join(options.home, ".local", "bin");
+  mkdirSync(stalePiDir, { recursive: true });
+  writeFileSync(join(stalePiDir, "pi"), "stale-0.73.1");
+  assert.equal(repairShadowedPiBinary({
+    dirs: [options.home, options.userHome],
+    bundledPiPath: bundledPi,
+    platform: "linux",
+    linkFn: (target, linkPath) => writeFileSync(linkPath, target, "utf8"),
+  }), 1);
+  assert.equal(readFileSync(join(stalePiDir, "pi"), "utf8"), realpathSync(bundledPi));
 }));
