@@ -28,8 +28,16 @@ export function withOpenRouterClaimLock(agent, fn) {
   return next;
 }
 
+export function freePoolExhaustedUntil(now = Date.now()) {
+  const until = Number(globalThis[Symbol.for("paperclip.freePool")]?.exhaustedUntil?.() ?? 0);
+  return Number.isFinite(until) && until > now ? until : 0;
+}
+
 export async function limitOpenRouterAvailableSlots(db, agent, availableSlots, sql, env = process.env) {
   if (agent?.adapterType !== "openrouter" || availableSlots <= 0) return availableSlots;
+  // Every free lane is cooling down: keep queued runs queued instead of burning
+  // them on guaranteed quota failures. The sweep re-dispatches once a lane reopens.
+  if (freePoolExhaustedUntil()) return 0;
   const globalMax = resolveOpenRouterMaxConcurrentRuns(env);
   const result = await db.execute(sql`
     select count(*)::int as count
@@ -548,7 +556,7 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {
       const runningRuns = Number(summaryRow.running_runs ?? 0);
       const queuedRuns = Number(summaryRow.queued_runs ?? 0);
       const scheduledRetryRuns = Number(summaryRow.scheduled_retry_runs ?? 0);
-      if (readyAgents > 0 && queuedRuns > 0 && runningRuns < resolveOpenRouterMaxConcurrentRuns() && typeof deps.notifyQueuedRunDispatch === "function") {
+      if (readyAgents > 0 && queuedRuns > 0 && runningRuns < resolveOpenRouterMaxConcurrentRuns() && !freePoolExhaustedUntil() && typeof deps.notifyQueuedRunDispatch === "function") {
         if (typeof db.transaction === "function") {
           await db.transaction(async (tx) => {
             await deps.notifyQueuedRunDispatch(tx);
@@ -570,6 +578,9 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {
           runningRuns,
           queuedRuns,
           scheduledRetryRuns,
+          freePoolExhaustedUntil: freePoolExhaustedUntil() ? new Date(freePoolExhaustedUntil()).toISOString() : null,
+          freePoolLanes: globalThis[Symbol.for("paperclip.freePool")]?.status?.().lanes
+            ?.map(lane => `${lane.id}:${lane.enabled ? (lane.cooldownUntil ? "cooling" : "ready") : "disabled"}:${lane.ok}/${lane.failed}`) ?? null,
           unparkedAgents: readiness.unparkedAgents,
           healedAgents: readiness.healedAgents,
           resumedAgents: readiness.resumedAgents,
@@ -971,7 +982,38 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
   output.lifecycle = replaceOnce(output.lifecycle,
     'new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString()',
     'new Date(now.getTime() + (error ? (agent.adapterType === "openrouter" && agent.lifecycleState === "verifying" ? 3_600_000 : 60_000) : 2_000)).toISOString()');
+  if (typeof output.runControl === "string") {
+    output.runControl = replaceOnce(output.runControl,
+      '    async function completedRunTerminationProof(run) {\n',
+      `    async function completedRunTerminationProof(run) {
+        const upstreamProof = await upstreamCompletedRunTerminationProof(run);
+        if (upstreamProof !== null || !isHeartbeatRunTerminalStatus(run.status))
+            return upstreamProof;
+        const inMemory = activeRunExecutions.has(run.id) || runningProcesses.has(run.id) ||
+            adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id);
+        if (inMemory)
+            return null;
+        const leases = await db.select().from(environmentLeases).where(and(eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+        const owner = await Promise.resolve(getAgent(run.agentId)).catch(() => null);
+        return openRouterLocalTerminationProof({ terminal: true, inMemory, agent: owner, leases });
+    }
+    async function upstreamCompletedRunTerminationProof(run) {
+`);
+    const runControlImports = imported("openRouterLocalTerminationProof");
+    if (!output.runControl.includes(runControlImports)) {
+      output.runControl = runControlImports + output.runControl;
+    }
+  }
   return output;
+}
+
+// Paperclip only accepts a committed budget Stop after it sees proof that the provider
+// process exited. The openrouter adapter runs Pi as an in-process local child that the
+// server awaits until exit, so a terminal run that no live execution map owns has no
+// surviving provider. Without this, such Stops stay pending forever.
+export function openRouterLocalTerminationProof({ terminal, inMemory, agent, leases }) {
+  if (!terminal || inMemory || agent?.adapterType !== "openrouter") return null;
+  return (leases ?? []).every(lease => lease?.provider === "local") ? "openrouter_local_terminal" : null;
 }
 
 export function enforceOpenRouterRecovery(root = fileURLToPath(new URL("..", import.meta.url))) {
@@ -987,6 +1029,7 @@ export function enforceOpenRouterRecovery(root = fileURLToPath(new URL("..", imp
     conversation: join(base, "server", "dist", "services", "conversation-continuation.js"),
     queue: join(base, "server", "dist", "services", "heartbeat", "queue.js"),
     lifecycle: join(base, "server", "dist", "modules", "agent-lifecycle", "adapters", "postgres.js"),
+    runControl: join(base, "server", "dist", "services", "heartbeat", "run-control.js"),
   };
   const sources = Object.fromEntries(Object.entries(files).map(([name, path]) => [name, readFileSync(path, "utf8")]));
   const patched = patchOpenRouterSources(sources);

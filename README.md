@@ -40,6 +40,27 @@ For `openrouter/free`, OpenRouter picks a free model per request and does not
 publish a fixed completion limit. The adapter caps requests at 4,096 output
 tokens (or the lower agent setting); rate limits and routed model limits still apply.
 
+### Free provider pool (Gemini free tier + OpenRouter free)
+
+OpenRouter's free router allows only 50 requests/day on accounts without credits.
+When the server has `GEMINI_API_KEY` (or `GOOGLE_API_KEY`) set, every OpenRouter
+run is sent through an in-process gateway on `127.0.0.1`. It spreads requests
+across Google's free-tier Gemini Flash models (each model has its own quota) and
+then `openrouter/free`. On a 429/503 it fails over to the next lane, and it parks
+each exhausted lane until its quota window or for at most one hour.
+
+- **Billing guard:** Gemini lanes only run while the key is proven to be free
+  tier. The gateway probes a paid-only model and expects a `FreeTier` 429. If the
+  Google project ever gets billing, Gemini lanes switch off automatically.
+- **Global gate:** when every lane is cooling down, queued runs stay queued
+  instead of burning retries. Dispatch resumes automatically once a lane recovers.
+- **Secrets:** Pi receives only a per-run gateway token. The real OpenRouter and
+  Gemini keys are not passed to Pi or its tool subprocesses.
+- **Privacy:** Google may use free-tier Gemini prompts to improve its products.
+  Set `PAPERCLIP_FREE_POOL=0` to disable the gateway, or `FREE_POOL_GEMINI=0` to
+  keep OpenRouter only. `FREE_POOL_GEMINI_MODELS` overrides the Gemini lane list
+  (comma-separated). Gateway telemetry is logged as JSON with `"tag":"freepool"`.
+
 ### Permanent hourly recovery
 
 Every failed, timed-out or interrupted OpenRouter run gets a database-backed

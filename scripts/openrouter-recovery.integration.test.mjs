@@ -31,6 +31,7 @@ const PATCHED_MODULE_PATHS = [
   join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "conversation-continuation.js"),
   join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "heartbeat", "queue.js"),
   join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "modules", "agent-lifecycle", "adapters", "postgres.js"),
+  join(REPO_ROOT, "node_modules", "@paperclipai", "server", "dist", "services", "heartbeat", "run-control.js"),
 ];
 
 test("durable hourly recovery survives restarts, exhausted budgets and concurrent schedulers", {

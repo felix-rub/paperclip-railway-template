@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createCatalog } from "./catalog.mjs";
+import { getSharedFreePool } from "./free-pool.mjs";
 import { COMPACT_PROMPT } from "./policy.mjs";
 
 const POLICY_PATH = fileURLToPath(new URL("./pi-policy.mjs", import.meta.url));
@@ -32,7 +33,11 @@ function failResult(errorCode, errorMessage, result = {}) {
 const INSTALL_COMMAND = "npm install -g @earendil-works/pi-coding-agent@0.78.1";
 const DOC = `# OpenRouter adapter
 
-Select OpenRouter as the agent adapter. All runs use openrouter/free.
+Select OpenRouter as the agent adapter. All runs use free models only.
+On the Railway runtime every model request goes through a local free-provider
+pool: Gemini free-tier models (only when GEMINI_API_KEY is verified to be on the
+free tier) and then openrouter/free. Quota or overload errors fail over to the
+next free lane; when every lane is exhausted, new runs stay queued.
 Saved model choices, paid fallbacks and escalation models are ignored.
 Failed runs wait one hour, then resume automatically without an attempt limit.
 Set OPENROUTER_API_KEY in the agent environment using a Paperclip secret reference,
@@ -132,9 +137,11 @@ function redactSecrets(value, extraSecret = "") {
   return out.slice(0, 300);
 }
 
-export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, minStartIntervalMs, onTelemetry, piCommand } = {}) {
+export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, minStartIntervalMs, onTelemetry, piCommand, freePool } = {}) {
   const catalog = createCatalog(fetchImpl);
   const isDefaultFetch = fetchImpl === fetch;
+  const pool = freePool !== undefined ? freePool
+    : (runtime === piRuntime && isDefaultFetch && process.env.PAPERCLIP_FREE_POOL !== "0" ? getSharedFreePool() : null);
   const defaultPiCommand = piCommand ?? resolveDefaultPiCommand();
   const waitForStartSlot = minStartIntervalMs === undefined ? sharedStartPacer : createStartPacer();
   const emitTelemetry = typeof onTelemetry === "function" ? onTelemetry : (entry) => console.log(JSON.stringify(entry));
@@ -249,6 +256,7 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
   async function runPolicy(ctx, config, policy) {
     const dir = await mkdtemp(join(tmpdir(), "paperclip-openrouter-"));
     const outcome = join(dir, "outcome.json");
+    let poolToken = null;
     try {
       const attempt = {
         ...config,
@@ -266,6 +274,20 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
         for (const key of ["PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID"]) delete attempt.env[key];
       }
       attempt.extraArgs.push("--extension", POLICY_PATH);
+      if (pool && ctx.executionTarget?.kind !== "ssh") {
+        const baseUrl = await pool.start();
+        poolToken = pool.issueToken({
+          openrouterKey: config.env.OPENROUTER_API_KEY, runId: ctx.runId ?? null, agentId: ctx.agent?.id ?? null,
+        });
+        const providers = JSON.parse(attempt.env.PAPERCLIP_PI_PROVIDERS);
+        providers.openrouter = { ...providers.openrouter, baseUrl, apiKey: poolToken };
+        attempt.env.PAPERCLIP_PI_PROVIDERS = JSON.stringify(providers);
+        // Pi prefers OPENROUTER_API_KEY over models.json; hand it the run-scoped pool
+        // token so the real key never reaches Pi or its tool subprocesses.
+        attempt.env.OPENROUTER_API_KEY = poolToken;
+        attempt.env.GEMINI_API_KEY = "";
+        attempt.env.GOOGLE_API_KEY = "";
+      }
       const startIntervalMs = resolveMinStartIntervalMs(minStartIntervalMs, isDefaultFetch);
       await waitForStartSlot(startIntervalMs, ctx.signal);
       if (ctx.signal?.aborted) {
@@ -344,6 +366,7 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
       recordInvokeTelemetry(result);
       return { result, state };
     } finally {
+      if (poolToken) pool.revokeToken(poolToken);
       await rm(dir, { recursive: true, force: true });
     }
   }

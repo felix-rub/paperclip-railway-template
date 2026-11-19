@@ -4,6 +4,7 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   limitOpenRouterAvailableSlots,
+  openRouterLocalTerminationProof,
   openRouterRetryOptions,
   orderQueuedAgentIds,
   patchOpenRouterSources,
@@ -13,6 +14,18 @@ import {
   withOpenRouterClaimLock,
   OPENROUTER_RETRY_MS,
 } from "./openrouter-recovery.mjs";
+
+test("committed budget Stops settle for finished local openrouter runs only", () => {
+  const agent = { adapterType: "openrouter" };
+  const local = [{ provider: "local" }];
+  assert.equal(openRouterLocalTerminationProof({ terminal: true, inMemory: false, agent, leases: [] }), "openrouter_local_terminal");
+  assert.equal(openRouterLocalTerminationProof({ terminal: true, inMemory: false, agent, leases: local }), "openrouter_local_terminal");
+  assert.equal(openRouterLocalTerminationProof({ terminal: true, inMemory: true, agent, leases: local }), null);
+  assert.equal(openRouterLocalTerminationProof({ terminal: false, inMemory: false, agent, leases: local }), null);
+  assert.equal(openRouterLocalTerminationProof({ terminal: true, inMemory: false, agent, leases: [{ provider: "e2b" }] }), null);
+  assert.equal(openRouterLocalTerminationProof({ terminal: true, inMemory: false, agent: { adapterType: "codex_local" }, leases: local }), null);
+  assert.equal(openRouterLocalTerminationProof({ terminal: true, inMemory: false, agent: null, leases: local }), null);
+});
 
 test("OpenRouter retries use the persisted failure clock, never exponential backoff or a finite budget", () => {
   const finishedAt = new Date("2026-11-18T10:00:00Z");
@@ -42,9 +55,12 @@ test("patch matches installed upstream, installs every hook, and remains idempot
     conversation: readFileSync(new URL(`${server}conversation-continuation.js`, import.meta.url), "utf8"),
     queue: readFileSync(new URL(`${server}heartbeat/queue.js`, import.meta.url), "utf8"),
     lifecycle: readFileSync(new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url), "utf8"),
+    runControl: readFileSync(new URL(`${server}heartbeat/run-control.js`, import.meta.url), "utf8"),
   };
   const patched = patchOpenRouterSources(sources);
   assert.deepEqual(patchOpenRouterSources(patched), patched);
+  assert.match(patched.runControl, /return openRouterLocalTerminationProof\(/);
+  assert.match(patched.runControl, /async function upstreamCompletedRunTerminationProof\(run\)/);
   assert.match(patched.retries, /opts = openRouterRetryOptions/);
   assert.match(patched.retries, /openRouterPrevAdapter !== "openrouter"/);
   assert.match(patched.completion, /"failed", "timed_out", "interrupted"/);
@@ -230,6 +246,7 @@ test("all patched Paperclip server modules resolve valid named ESM exports", asy
     conversation: new URL("../node_modules/@paperclipai/server/dist/services/conversation-continuation.js", import.meta.url),
     queue: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/queue.js", import.meta.url),
     lifecycle: new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url),
+    runControl: new URL("../node_modules/@paperclipai/server/dist/services/heartbeat/run-control.js", import.meta.url),
   };
   const sources = Object.fromEntries(Object.entries(targets).map(([k, url]) => [k, readFileSync(url, "utf8")]));
   const patched = patchOpenRouterSources(sources);
