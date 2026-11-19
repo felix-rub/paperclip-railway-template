@@ -3,6 +3,69 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 export const OPENROUTER_RETRY_MS = 60 * 60 * 1000;
+export const DEFAULT_OPENROUTER_MAX_CONCURRENT_RUNS = 2;
+const DEFAULT_SWEEP_BATCH_LIMIT = 25;
+const DEFAULT_DIRECT_SWEEP_LIMIT = 200;
+const DEFAULT_SWEEP_INITIAL_DELAY_MS = 2_000;
+const DEFAULT_SWEEP_CONTINUATION_DELAY_MS = 2_000;
+const DEFAULT_SWEEP_MIN_INTERVAL_MS = 60_000;
+
+export function resolveOpenRouterMaxConcurrentRuns(env = process.env) {
+  const raw = env?.OPENROUTER_MAX_CONCURRENT_RUNS;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isSafeInteger(parsed) && parsed >= 1) return parsed;
+  }
+  return DEFAULT_OPENROUTER_MAX_CONCURRENT_RUNS;
+}
+
+let openRouterClaimChain = Promise.resolve();
+
+export function withOpenRouterClaimLock(agent, fn) {
+  if (agent?.adapterType !== "openrouter") return fn();
+  const next = openRouterClaimChain.then(fn, fn);
+  openRouterClaimChain = next.then(() => undefined, () => undefined);
+  return next;
+}
+
+export async function limitOpenRouterAvailableSlots(db, agent, availableSlots, sql, env = process.env) {
+  if (agent?.adapterType !== "openrouter" || availableSlots <= 0) return availableSlots;
+  const globalMax = resolveOpenRouterMaxConcurrentRuns(env);
+  const result = await db.execute(sql`
+    select count(*)::int as count
+    from heartbeat_runs r
+    join agents a on a.id = r.agent_id and a.company_id = r.company_id
+    where r.status = 'running'
+      and a.adapter_type = 'openrouter'
+  `);
+  const rows = result.rows ?? result;
+  if (!Array.isArray(rows)) throw new Error("Unexpected OpenRouter concurrency query result.");
+  const runningGlobal = Number(rows[0]?.count ?? 0);
+  return Math.max(0, Math.min(availableSlots, globalMax - runningGlobal));
+}
+
+let drainInFlight = false;
+let drainRerunRequested = false;
+
+export function triggerOpenRouterQueueDrain(resumeFn, logger) {
+  if (drainInFlight) {
+    drainRerunRequested = true;
+    return;
+  }
+  drainInFlight = true;
+  void (async () => {
+    do {
+      drainRerunRequested = false;
+      try {
+        await resumeFn();
+      } catch (error) {
+        logger?.warn?.({ err: error }, "failed to resume queued OpenRouter runs after completion");
+      }
+    } while (drainRerunRequested);
+  })().finally(() => {
+    drainInFlight = false;
+  });
+}
 
 export function openRouterRetryOptions(run, agent, options) {
   if (agent.adapterType !== "openrouter") return options;
@@ -34,8 +97,9 @@ export async function hasOpenRouterHourlyWait(db, agent, sql) {
 
 // The ordinary retry service owns locks, authorization, session inheritance and
 // successor deduplication. This sweep only recovers terminal work it missed.
-export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
-  if (!deps.scheduleRecoveryRetry) return;
+export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {}) {
+  if (!deps.scheduleRecoveryRetry) return { selected: 0, scheduled: 0 };
+  const limit = Number.isSafeInteger(opts?.limit) && opts.limit > 0 ? opts.limit : DEFAULT_DIRECT_SWEEP_LIMIT;
   await db.execute(sql`
     update heartbeat_runs waiting
     set scheduled_retry_at = predecessor.finished_at + interval '1 hour',
@@ -51,6 +115,44 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
       and predecessor.status in ('failed', 'timed_out', 'interrupted')
       and predecessor.finished_at is not null
       and waiting.scheduled_retry_at is distinct from predecessor.finished_at + interval '1 hour'
+  `);
+  await db.execute(sql`
+    with superseded_company_retries as (
+      update heartbeat_runs waiting
+      set status = 'cancelled',
+          finished_at = coalesce(waiting.finished_at, now()),
+          error = coalesce(waiting.error, 'Superseded by newer company-scoped OpenRouter run'),
+          updated_at = now()
+      from agents a
+      where a.id = waiting.agent_id and a.company_id = waiting.company_id
+        and a.adapter_type = 'openrouter'
+        and waiting.scope_kind = 'company'
+        and nullif(coalesce(waiting.issue_id::text, waiting.context_snapshot ->> 'issueId'), '') is null
+        and waiting.retry_of_run_id is not null
+        and (
+          waiting.status = 'scheduled_retry'
+          or (waiting.status = 'queued' and waiting.started_at is null)
+        )
+        and exists (
+          select 1 from heartbeat_runs newer
+          where newer.company_id = waiting.company_id
+            and newer.agent_id = waiting.agent_id
+            and newer.scope_kind = 'company'
+            and nullif(coalesce(newer.issue_id::text, newer.context_snapshot ->> 'issueId'), '') is null
+            and newer.status in ('scheduled_retry', 'queued', 'running')
+            and (newer.created_at, newer.id) > (waiting.created_at, waiting.id)
+        )
+      returning waiting.wakeup_request_id
+    )
+    update agent_wakeup_requests w
+    set status = 'cancelled',
+        finished_at = coalesce(w.finished_at, now()),
+        error = coalesce(w.error, 'Superseded by newer company-scoped OpenRouter run'),
+        updated_at = now()
+    from superseded_company_retries s
+    where s.wakeup_request_id is not null
+      and w.id = s.wakeup_request_id
+      and w.status in ('queued', 'claimed', 'deferred_issue_execution')
   `);
   const result = await db.execute(sql`
     select r.id
@@ -110,11 +212,21 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
         where newer.company_id = r.company_id
           and (
             (i.id is not null and nullif(coalesce(newer.issue_id::text, newer.context_snapshot ->> 'issueId'), '') = i.id::text)
-            or (i.id is null and newer.scope_kind = 'company' and newer.agent_id = r.agent_id
-              and coalesce(newer.context_snapshot ->> 'taskKey', '') =
-                  coalesce(r.context_snapshot ->> 'taskKey', ''))
+            or (
+              i.id is null
+              and newer.agent_id = r.agent_id
+              and newer.scope_kind = 'company'
+              and nullif(coalesce(newer.issue_id::text, newer.context_snapshot ->> 'issueId'), '') is null
+              and (
+                newer.status in ('scheduled_retry', 'queued', 'running')
+                or (newer.created_at, newer.id) > (r.created_at, r.id)
+              )
+            )
           )
-          and (newer.created_at, newer.id) > (r.created_at, r.id)
+          and (
+            i.id is null
+            or (newer.created_at, newer.id) > (r.created_at, r.id)
+          )
       )
       and not exists (
         select 1 from agent_task_sessions s
@@ -130,17 +242,62 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger) {
           and suppressed.created_at > now() - interval '1 hour'
       )
     order by r.created_at, r.id
-    limit 200
+    limit ${limit}
   `);
   const rows = result.rows ?? result;
   if (!Array.isArray(rows)) throw new Error("Unexpected OpenRouter recovery query result.");
+  let scheduled = 0;
   for (const row of rows) {
     try {
       await deps.scheduleRecoveryRetry(row.id);
+      scheduled += 1;
     } catch (error) {
       logger.error({ err: error, runId: row.id }, "OpenRouter hourly retry scheduling failed; the next sweep will retry");
     }
   }
+  return { selected: rows.length, scheduled };
+}
+
+const sweepStates = new WeakMap();
+
+// Schedule OpenRouter retry reconciliation out-of-band so startup issue-state
+// recovery (`registerIssueStateRecoveryWork(...).ready`) never blocks readiness.
+export function scheduleOpenRouterRetrySweep(db, deps, sql, logger, opts = {}) {
+  if (!db || typeof db !== "object" || !deps?.scheduleRecoveryRetry) return false;
+  let state = sweepStates.get(db);
+  if (!state) {
+    state = { timer: null, inFlight: false, lastFinishedAt: 0 };
+    sweepStates.set(db, state);
+  }
+  if (state.timer || state.inFlight) return false;
+  const initialDelayMs = opts.initialDelayMs ?? DEFAULT_SWEEP_INITIAL_DELAY_MS;
+  const continuationDelayMs = opts.continuationDelayMs ?? DEFAULT_SWEEP_CONTINUATION_DELAY_MS;
+  const minIntervalMs = opts.minIntervalMs ?? DEFAULT_SWEEP_MIN_INTERVAL_MS;
+  const batchLimit = opts.limit ?? DEFAULT_SWEEP_BATCH_LIMIT;
+  const now = Date.now();
+  if (state.lastFinishedAt > 0 && now - state.lastFinishedAt < minIntervalMs) return false;
+  const schedulePass = (delayMs) => {
+    state.timer = setTimeout(async () => {
+      state.timer = null;
+      state.inFlight = true;
+      let moreRemain = false;
+      try {
+        const res = await reconcileOpenRouterRetries(db, deps, sql, logger, { limit: batchLimit });
+        moreRemain = (res?.selected ?? 0) >= batchLimit;
+      } catch (error) {
+        logger?.error?.({ err: error }, "OpenRouter background retry sweep failed");
+      } finally {
+        state.inFlight = false;
+        state.lastFinishedAt = Date.now();
+        if (moreRemain && !state.timer) {
+          schedulePass(continuationDelayMs);
+        }
+      }
+    }, delayMs);
+    state.timer.unref?.();
+  };
+  schedulePass(initialDelayMs);
+  return true;
 }
 
 function replaceOnce(source, before, after) {
@@ -217,9 +374,9 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     'import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";\nimport { runUsedConversationAdapter } from "../conversation-continuation.js";');
   output.recovery = replaceOnce(output.recovery,
     '    async function reconcileStrandedAssignedIssues(opts) {',
-    '    async function reconcileStrandedAssignedIssues(opts) {\n        await reconcileOpenRouterRetries(db, deps, sql, logger);');
-  if (!output.recovery.includes(imported("reconcileOpenRouterRetries"))) {
-    output.recovery = imported("reconcileOpenRouterRetries") + output.recovery;
+    '    async function reconcileStrandedAssignedIssues(opts) {\n        scheduleOpenRouterRetrySweep(db, deps, sql, logger);');
+  if (!output.recovery.includes(imported("scheduleOpenRouterRetrySweep"))) {
+    output.recovery = imported("scheduleOpenRouterRetrySweep") + output.recovery;
   }
   output.recovery = replaceOnce(output.recovery,
     '            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);',
@@ -271,6 +428,33 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     '    "pi_local", "grok_local", "kimi_local", "hermes_local",',
     '    "pi_local", "grok_local", "kimi_local", "hermes_local", "openrouter",');
   output.queue = replaceOnce(output.queue,
+    '            const policy = parseHeartbeatPolicy(agent);\n            const runningCount = await countRunningRunsForAgent(agentId);\n            const availableSlots = Math.max(0, policy.maxConcurrentRuns - runningCount);',
+    `            return withOpenRouterClaimLock(agent, async () => {
+            const policy = parseHeartbeatPolicy(agent);
+            const runningCount = await countRunningRunsForAgent(agentId);
+            const availableSlots = await limitOpenRouterAvailableSlots(db, agent, Math.max(0, policy.maxConcurrentRuns - runningCount), sql);`);
+  output.queue = replaceOnce(output.queue,
+    `                void execution.finally(() => {
+                    // drainActiveRunExecutions loops on activeRunExecutionPromises.size,
+                    // so an entry that never clears here would hang it forever.
+                    activeRunExecutionPromises.delete(execution);
+                });
+            }
+            return claimedRuns;
+        }).finally(async () => {`,
+    `                void execution.finally(() => {
+                    // drainActiveRunExecutions loops on activeRunExecutionPromises.size,
+                    // so an entry that never clears here would hang it forever.
+                    activeRunExecutionPromises.delete(execution);
+                    if (agent.adapterType === "openrouter") {
+                        triggerOpenRouterQueueDrain(() => resumeQueuedRunsAfterDrain(), logger);
+                    }
+                });
+            }
+            return claimedRuns;
+            });
+        }).finally(async () => {`);
+  output.queue = replaceOnce(output.queue,
     '        if (policy.skipTimerWhenNoActionableWork &&',
     `        if (genericTimerWake && await hasOpenRouterHourlyWait(db, agent, sql)) {
             await writeSkippedHeartbeatRequest("heartbeat.openrouter.hourly_wait", {
@@ -280,8 +464,9 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
             return null;
         }
         if (policy.skipTimerWhenNoActionableWork &&`);
-  if (!output.queue.includes(imported("hasOpenRouterHourlyWait"))) {
-    output.queue = imported("hasOpenRouterHourlyWait") + output.queue;
+  const queueImports = imported("hasOpenRouterHourlyWait, limitOpenRouterAvailableSlots, triggerOpenRouterQueueDrain, withOpenRouterClaimLock");
+  if (!output.queue.includes(queueImports)) {
+    output.queue = queueImports + output.queue;
   }
   output.lifecycle = replaceOnce(output.lifecycle,
     'new Date(now.getTime() + (error ? 60_000 : 2_000)).toISOString()',

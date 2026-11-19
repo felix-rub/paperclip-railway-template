@@ -312,3 +312,33 @@ test("free router pricing changes fail closed without invoking inference", async
   assert.equal(result.exitCode, 1);
   assert.match(result.errorMessage, /refusing paid inference/);
 });
+
+test("start pacing spaces concurrent OpenRouter runs and honors abort signals while waiting", async () => {
+  const starts = [];
+  const adapter = createServerAdapter({
+    fetchImpl: fetchCatalog,
+    minStartIntervalMs: 60,
+    runtime: {
+      async execute() {
+        starts.push(Date.now());
+        return { exitCode: 0 };
+      },
+    },
+  });
+  const abortController = new AbortController();
+  setTimeout(() => abortController.abort(), 15);
+  const [r1, r2, r3] = await Promise.all([
+    adapter.execute({ config: { env: { OPENROUTER_API_KEY: fakeKey } }, onLog: async () => {} }),
+    adapter.execute({ config: { env: { OPENROUTER_API_KEY: fakeKey } }, onLog: async () => {} }),
+    adapter.execute({
+      config: { env: { OPENROUTER_API_KEY: fakeKey } },
+      signal: abortController.signal,
+      onLog: async () => {},
+    }),
+  ]);
+  assert.equal(r1.exitCode, 0);
+  assert.equal(r2.exitCode, 0);
+  assert.equal(r3.errorCode, "cancelled");
+  assert.equal(starts.length, 2);
+  assert.ok(starts[1] - starts[0] >= 45, `Expected paced start interval >= 45ms, got ${starts[1] - starts[0]}ms`);
+});

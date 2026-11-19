@@ -3,10 +3,16 @@ import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { and, eq, sql } from "drizzle-orm";
 import {
-  activityLog, agents, companies, heartbeatRuns, issues,
+  activityLog, agents, agentWakeupRequests, companies, heartbeatRuns, issues,
   applyPendingMigrations, closeRegisteredClients, createDb,
 } from "@paperclipai/db";
-import { enforceOpenRouterRecovery, hasOpenRouterHourlyWait, reconcileOpenRouterRetries, OPENROUTER_RETRY_MS } from "./openrouter-recovery.mjs";
+import {
+  enforceOpenRouterRecovery,
+  hasOpenRouterHourlyWait,
+  limitOpenRouterAvailableSlots,
+  reconcileOpenRouterRetries,
+  OPENROUTER_RETRY_MS,
+} from "./openrouter-recovery.mjs";
 
 test("durable hourly recovery survives restarts, exhausted budgets and concurrent schedulers", {
   skip: !process.env.OPENROUTER_TEST_DATABASE_URL, timeout: 120_000,
@@ -178,6 +184,61 @@ test("durable hourly recovery survives restarts, exhausted budgets and concurren
     assert.equal(await store.claim(verifying.id, owner, new Date(+now + OPENROUTER_RETRY_MS - 1)), null);
     const readyToRetry = await store.claim(verifying.id, owner, new Date(+now + OPENROUTER_RETRY_MS));
     assert.equal(readyToRetry.lifecycleOperation.attempts, 1_000_001);
+
+    // Company-scoped runs with distinct historical taskKeys deduplicate to a single retry
+    // per agent, and pre-existing redundant company retries are cancelled along with wakeups.
+    const companyDedup = await fixture({ scopeKind: "company", code: "adapter_failed" });
+    const [newerCompanyFailure] = await db.insert(heartbeatRuns).values({
+      companyId: companyDedup.companyId,
+      agentId: companyDedup.agent.id,
+      invocationSource: "timer",
+      scopeKind: "company",
+      status: "failed",
+      errorCode: "adapter_failed",
+      finishedAt: new Date(+now + 5_000),
+      createdAt: new Date(+now + 5_000),
+      contextSnapshot: { taskKey: `timer-${randomUUID()}` },
+      runnerProfileJson: { adapterDispatch: { adapterType: "openrouter" } },
+      resultJson: {},
+    }).returning();
+    await reconcileOpenRouterRetries(db, factory(), sql, logger);
+    assert.equal((await successors(companyDedup.run)).length, 0, "Older company failure must be superseded by newer company run");
+    const [latestCompanyRetry] = await successors(newerCompanyFailure);
+    assert.ok(latestCompanyRetry, "Latest company failure must still schedule one hourly retry");
+
+    const [staleWake] = await db.insert(agentWakeupRequests).values({
+      companyId: companyDedup.companyId,
+      agentId: companyDedup.agent.id,
+      source: "automation",
+      status: "queued",
+    }).returning();
+    const [staleDupRetry] = await db.insert(heartbeatRuns).values({
+      companyId: companyDedup.companyId,
+      agentId: companyDedup.agent.id,
+      invocationSource: "automation",
+      scopeKind: "company",
+      status: "scheduled_retry",
+      retryOfRunId: companyDedup.run.id,
+      wakeupRequestId: staleWake.id,
+      scheduledRetryAt: new Date(+now + OPENROUTER_RETRY_MS),
+      createdAt: new Date(+now - 10_000),
+      contextSnapshot: { taskKey: `stale-${randomUUID()}` },
+    }).returning();
+    await reconcileOpenRouterRetries(db, factory(), sql, logger);
+    const [cleanedRetry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, staleDupRetry.id));
+    const [cleanedWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, staleWake.id));
+    const [preservedRetry] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, latestCompanyRetry.id));
+    assert.equal(cleanedRetry.status, "cancelled");
+    assert.equal(cleanedWake.status, "cancelled");
+    assert.equal(preservedRetry.status, "scheduled_retry");
+
+    // Global OpenRouter concurrency limit counts running OpenRouter runs across orgs.
+    const runningA = await fixture({ runStatus: "running" });
+    const runningB = await fixture({ runStatus: "running" });
+    const candidateOr = await fixture();
+    assert.ok(runningA && runningB);
+    assert.equal(await limitOpenRouterAvailableSlots(db, candidateOr.agent, 2, sql, {}), 0);
+    assert.equal(await limitOpenRouterAvailableSlots(db, other.agent, 2, sql, {}), 2);
   } finally {
     await closeRegisteredClients(url);
   }

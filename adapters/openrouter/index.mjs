@@ -56,8 +56,66 @@ function prepareEnvironment(config) {
   return { ...env, OPENROUTER_API_KEY: key.trim() };
 }
 
-export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } = {}) {
+const DEFAULT_PRODUCTION_START_INTERVAL_MS = 3_500;
+
+function createStartPacer() {
+  let nextAllowedAt = 0;
+  let gate = Promise.resolve();
+  return function waitForStartSlot(intervalMs, signal) {
+    if (intervalMs <= 0) return Promise.resolve();
+    const turn = gate.then(async () => {
+      if (signal?.aborted) return;
+      const waitMs = nextAllowedAt - Date.now();
+      if (waitMs > 0) {
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => {
+            if (signal) signal.removeEventListener("abort", onAbort);
+            resolve();
+          }, waitMs);
+          timer.unref?.();
+          function onAbort() {
+            clearTimeout(timer);
+            resolve();
+          }
+          if (signal) {
+            if (signal.aborted) {
+              onAbort();
+              return;
+            }
+            signal.addEventListener("abort", onAbort, { once: true });
+          }
+        });
+      }
+      if (!signal?.aborted) {
+        nextAllowedAt = Date.now() + intervalMs;
+      }
+    });
+    gate = turn.then(() => undefined, () => undefined);
+    return turn;
+  };
+}
+
+const sharedStartPacer = createStartPacer();
+
+function resolveMinStartIntervalMs(explicitMs, isDefaultFetch, env = process.env) {
+  if (explicitMs !== undefined) {
+    if (!Number.isSafeInteger(explicitMs) || explicitMs < 0) {
+      throw new Error("OpenRouter minStartIntervalMs must be a non-negative integer.");
+    }
+    return explicitMs;
+  }
+  const raw = env?.OPENROUTER_MIN_START_INTERVAL_MS;
+  if (raw !== undefined && raw !== "") {
+    const parsed = Number(raw);
+    if (Number.isSafeInteger(parsed) && parsed >= 0) return parsed;
+  }
+  return isDefaultFetch ? DEFAULT_PRODUCTION_START_INTERVAL_MS : 0;
+}
+
+export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, minStartIntervalMs } = {}) {
   const catalog = createCatalog(fetchImpl);
+  const isDefaultFetch = fetchImpl === fetch;
+  const waitForStartSlot = minStartIntervalMs === undefined ? sharedStartPacer : createStartPacer();
   async function prepareConfig(config) {
     if ((Array.isArray(config.extraArgs) && config.extraArgs.length) ||
         (Array.isArray(config.args) && config.args.length)) {
@@ -138,6 +196,14 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch } =
         for (const key of ["PAPERCLIP_API_URL", "PAPERCLIP_API_KEY", "PAPERCLIP_RUN_ID", "PAPERCLIP_TASK_ID"]) delete attempt.env[key];
       }
       attempt.extraArgs.push("--extension", POLICY_PATH);
+      const startIntervalMs = resolveMinStartIntervalMs(minStartIntervalMs, isDefaultFetch);
+      await waitForStartSlot(startIntervalMs, ctx.signal);
+      if (ctx.signal?.aborted) {
+        return {
+          result: { exitCode: 1, signal: "SIGTERM", timedOut: false, errorCode: "cancelled", errorMessage: "Run aborted before execution." },
+          state: {},
+        };
+      }
       const result = await runtime.execute({ ...ctx, config: attempt });
       if (!policy.compact) return { result, state: {} };
       let state;
