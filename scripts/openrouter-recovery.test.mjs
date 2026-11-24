@@ -101,6 +101,16 @@ test("control-plane cleanup uses SQL predicates instead of Drizzle UUID array in
   const fakeDb = {
     async execute(query) {
       queries.push(query);
+      if (query.text.includes("with stale_detached as")) {
+        return {
+          rows: [{
+            id: "0af8d8bb-6243-4d8e-aa44-b83f55b348c6",
+            company_id: "b8256505-bd3d-4321-9c59-f4c211b7e7fc",
+            agent_id: "3691950c-473b-4ffd-9aa2-c9320440b8ca",
+            error: "Lost in-memory process handle (different_process_space)",
+          }],
+        };
+      }
       if (query.text.includes("from routines r\n    join companies c")) {
         return {
           rows: [{
@@ -115,7 +125,9 @@ test("control-plane cleanup uses SQL predicates instead of Drizzle UUID array in
     },
   };
   const result = await reconcileOpenRouterControlPlane(fakeDb, sqlTag, { info() {} });
+  assert.equal(result.detachedRunsRecovered, 1);
   assert.equal(result.routinesPaused, 1);
+  assert.ok(queries.some(query => query.text.includes("with stale_detached as")));
   assert.ok(queries.some(query => query.text.includes("update routine_triggers")));
   assert.ok(queries.some(query => query.text.includes("update routines")));
   assert.ok(queries.some(query => query.text.includes("cancel_routine_runs as")));
@@ -134,7 +146,12 @@ test("control-plane cleanup failure cannot block scheduler or retry recovery", a
       errors.push({ payload, message });
     },
   });
-  assert.deepEqual(result, { policiesHealed: 0, routinesPaused: 0, issuesCancelled: 0 });
+  assert.deepEqual(result, {
+    detachedRunsRecovered: 0,
+    policiesHealed: 0,
+    routinesPaused: 0,
+    issuesCancelled: 0,
+  });
   assert.equal(errors.length, 1);
   assert.equal(errors[0].payload.tag, "openrouter.reconcile.control_plane_error");
   assert.match(errors[0].message, /execution recovery continues/);
@@ -243,6 +260,7 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
       return fn({ isTransaction: true });
     },
     async execute(query) {
+      if (query.text.includes("with stale_detached as")) return { rows: [] };
       if (query.text.includes("update budget_policies p")) return { rows: [] };
       if (query.text.includes("insert into budget_policies")) return { rows: [] };
       if (query.text.includes("budget_monthly_cents")) return { rows: [] };

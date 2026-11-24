@@ -320,6 +320,49 @@ const stateLogTimestamps = new WeakMap();
 const STATE_LOG_INTERVAL_MS = 5 * 60_000;
 
 export async function reconcileOpenRouterControlPlane(db, sql, logger) {
+  const detachedRes = await db.execute(sql`
+    with stale_detached as (
+      update heartbeat_runs r
+      set status = 'interrupted',
+          finished_at = coalesce(r.finished_at, now()),
+          updated_at = now()
+      from agents a, companies c
+      where a.id = r.agent_id
+        and a.company_id = r.company_id
+        and c.id = r.company_id
+        and c.status = 'active'
+        and a.adapter_type = 'openrouter'
+        and r.status = 'running'
+        and r.error_code = 'process_detached'
+        and r.error like '%different_process_space%'
+        and coalesce(r.process_started_at, r.updated_at, r.created_at) < now() - interval '10 minutes'
+      returning r.id, r.company_id, r.agent_id, r.wakeup_request_id, r.error
+    ),
+    cancel_wakeups as (
+      update agent_wakeup_requests w
+      set status = 'cancelled',
+          error = coalesce(w.error, 'Recovered detached OpenRouter process ownership'),
+          finished_at = coalesce(w.finished_at, now()),
+          updated_at = now()
+      from stale_detached s
+      where (w.id = s.wakeup_request_id or w.run_id = s.id)
+        and w.status in ('queued', 'claimed', 'deferred_issue_execution')
+      returning w.id
+    )
+    select id, company_id, agent_id, error from stale_detached
+  `);
+  const detachedRuns = detachedRes.rows ?? detachedRes;
+  if (Array.isArray(detachedRuns)) {
+    for (const run of detachedRuns) {
+      logger?.info?.({
+        tag: "openrouter.reconcile.detached_run",
+        companyId: run.company_id,
+        agentId: run.agent_id,
+        runId: run.id,
+        reason: run.error,
+      }, "Recovered stale detached OpenRouter run");
+    }
+  }
   const policyRes = await db.execute(sql`
     update budget_policies p
     set amount = greatest(p.amount, 10000),
@@ -552,6 +595,7 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
   }
   const policyRows = policyRes.rows ?? policyRes;
   return {
+    detachedRunsRecovered: Array.isArray(detachedRuns) ? detachedRuns.length : 0,
     policiesHealed: Array.isArray(policyRows) ? policyRows.length : 0,
     routinesPaused: routineIds.length,
     issuesCancelled: Array.isArray(issues) ? issues.length : 0,
@@ -566,7 +610,12 @@ export async function reconcileOpenRouterControlPlaneSafely(db, sql, logger) {
       err: error,
       tag: "openrouter.reconcile.control_plane_error",
     }, "OpenRouter control-plane cleanup failed; execution recovery continues");
-    return { policiesHealed: 0, routinesPaused: 0, issuesCancelled: 0 };
+    return {
+      detachedRunsRecovered: 0,
+      policiesHealed: 0,
+      routinesPaused: 0,
+      issuesCancelled: 0,
+    };
   }
 }
 
