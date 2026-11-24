@@ -9,6 +9,8 @@ import {
   orderQueuedAgentIds,
   orderQueuedAgents,
   patchOpenRouterSources,
+  reconcileOpenRouterControlPlane,
+  reconcileOpenRouterControlPlaneSafely,
   reconcileOpenRouterRetries,
   scheduleOpenRouterRetrySweep,
   triggerOpenRouterQueueDrain,
@@ -79,7 +81,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.queue, /const claimedRuns = await withOpenRouterClaimLock\(agent, async \(\) => \{/);
   assert.match(patched.queue, /limitOpenRouterAvailableSlots\(db, agent,/);
   assert.match(patched.queue, /triggerOpenRouterQueueDrain\(\(\) => resumeQueuedRunsAfterDrain\(\), logger\)/);
-  assert.match(patched.routines, /await reconcileOpenRouterControlPlane\(db, sql, logger\)/);
+  assert.match(patched.routines, /await reconcileOpenRouterControlPlaneSafely\(db, sql, logger\)/);
   assert.match(patched.pi, /retry: \{ enabled: false, maxRetries: 0, provider: \{ maxRetries: 0 \} \}/);
   assert.match(patched.piExecute, /localSystemPromptPath/);
   assert.match(patched.piExecute, /stdin: !executionTargetIsRemote && userPrompt\.trim\(\)\.length > 0/);
@@ -91,6 +93,51 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   const changed = { ...sources, retries: "unexpected upstream implementation" };
   assert.throws(() => patchOpenRouterSources(changed), /no longer matches upstream/);
   assert.equal(changed.retries, "unexpected upstream implementation");
+});
+
+test("control-plane cleanup uses SQL predicates instead of Drizzle UUID array interpolation", async () => {
+  const queries = [];
+  const sqlTag = (strings, ...values) => ({ text: strings.join("?"), values });
+  const fakeDb = {
+    async execute(query) {
+      queries.push(query);
+      if (query.text.includes("from routines r\n    join companies c")) {
+        return {
+          rows: [{
+            id: "23deafef-15aa-4b13-bace-1bba09b553e8",
+            company_id: "6b160208-dbce-4f79-97df-34b49f97f442",
+            title: "Old model watcher",
+            reason: "obsolete_model_automation",
+          }],
+        };
+      }
+      return { rows: [] };
+    },
+  };
+  const result = await reconcileOpenRouterControlPlane(fakeDb, sqlTag, { info() {} });
+  assert.equal(result.routinesPaused, 1);
+  assert.ok(queries.some(query => query.text.includes("update routine_triggers")));
+  assert.ok(queries.some(query => query.text.includes("update routines")));
+  assert.ok(queries.some(query => query.text.includes("cancel_routine_runs as")));
+  assert.doesNotMatch(queries.map(query => query.text).join("\n"), /any\(\?/);
+  assert.equal(queries.some(query => query.values.some(Array.isArray)), false);
+});
+
+test("control-plane cleanup failure cannot block scheduler or retry recovery", async () => {
+  const errors = [];
+  const result = await reconcileOpenRouterControlPlaneSafely({
+    async execute() {
+      throw new Error("synthetic cleanup failure");
+    },
+  }, (strings, ...values) => ({ strings, values }), {
+    error(payload, message) {
+      errors.push({ payload, message });
+    },
+  });
+  assert.deepEqual(result, { policiesHealed: 0, routinesPaused: 0, issuesCancelled: 0 });
+  assert.equal(errors.length, 1);
+  assert.equal(errors[0].payload.tag, "openrouter.reconcile.control_plane_error");
+  assert.match(errors[0].message, /execution recovery continues/);
 });
 
 test("scheduleOpenRouterRetrySweep runs out-of-band in bounded batches without blocking startup", async () => {

@@ -409,12 +409,34 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
     await db.execute(sql`
       update routine_triggers
       set enabled = false, archived = true, next_run_at = null, updated_at = now()
-      where routine_id = any(${routineIds}::uuid[])
+      where exists (
+        select 1
+        from routines r
+        join companies c on c.id = r.company_id and c.status = 'active'
+        left join agents a on a.id = r.assignee_agent_id and a.company_id = r.company_id
+        where r.id = routine_triggers.routine_id
+          and r.status = 'active'
+          and (
+            lower(coalesce(r.title, '') || ' ' || coalesce(r.description, '')) ~ ${routineMatch}
+            or a.status = 'terminated'
+            or a.lifecycle_state = 'terminated'
+          )
+      )
     `);
     await db.execute(sql`
       update routines
       set status = 'paused', updated_at = now()
-      where id = any(${routineIds}::uuid[]) and status = 'active'
+      where status = 'active'
+        and exists (select 1 from companies c where c.id = routines.company_id and c.status = 'active')
+        and (
+          lower(coalesce(title, '') || ' ' || coalesce(description, '')) ~ ${routineMatch}
+          or exists (
+            select 1 from agents a
+            where a.id = routines.assignee_agent_id
+              and a.company_id = routines.company_id
+              and (a.status = 'terminated' or a.lifecycle_state = 'terminated')
+          )
+        )
     `);
   }
   const issueRes = await db.execute(sql`
@@ -483,7 +505,20 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
           updated_at = now()
       where rr.status not in ('completed', 'succeeded', 'failed', 'cancelled', 'skipped', 'coalesced')
         and (
-          rr.routine_id = any(${routineIds}::uuid[])
+          exists (
+            select 1
+            from routines source_routine
+            left join agents source_agent
+              on source_agent.id = source_routine.assignee_agent_id
+              and source_agent.company_id = source_routine.company_id
+            where source_routine.id = rr.routine_id
+              and source_routine.company_id = rr.company_id
+              and (
+                lower(coalesce(source_routine.title, '') || ' ' || coalesce(source_routine.description, '')) ~ ${routineMatch}
+                or source_agent.status = 'terminated'
+                or source_agent.lifecycle_state = 'terminated'
+              )
+          )
           or rr.linked_issue_id in (select id from target_issues)
         )
       returning rr.id
@@ -521,6 +556,18 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
     routinesPaused: routineIds.length,
     issuesCancelled: Array.isArray(issues) ? issues.length : 0,
   };
+}
+
+export async function reconcileOpenRouterControlPlaneSafely(db, sql, logger) {
+  try {
+    return await reconcileOpenRouterControlPlane(db, sql, logger);
+  } catch (error) {
+    logger?.error?.({
+      err: error,
+      tag: "openrouter.reconcile.control_plane_error",
+    }, "OpenRouter control-plane cleanup failed; execution recovery continues");
+    return { policiesHealed: 0, routinesPaused: 0, issuesCancelled: 0 };
+  }
 }
 
 export async function reconcileOpenRouterAgentReadiness(db, deps, sql, logger) {
@@ -614,7 +661,7 @@ export async function reconcileOpenRouterAgentReadiness(db, deps, sql, logger) {
 export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {}) {
   if (!deps.scheduleRecoveryRetry) return { selected: 0, scheduled: 0 };
   const limit = Number.isSafeInteger(opts?.limit) && opts.limit > 0 ? opts.limit : DEFAULT_DIRECT_SWEEP_LIMIT;
-  const controlPlane = await reconcileOpenRouterControlPlane(db, sql, logger);
+  const controlPlane = await reconcileOpenRouterControlPlaneSafely(db, sql, logger);
   const readiness = await reconcileOpenRouterAgentReadiness(db, deps, sql, logger);
   await db.execute(sql`
     update heartbeat_runs waiting
@@ -991,9 +1038,9 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     output.routines = replaceOnce(output.routines,
       "        tickScheduledTriggers: async (now = new Date(), canContinue = () => true) => {",
       `        tickScheduledTriggers: async (now = new Date(), canContinue = () => true) => {
-            await reconcileOpenRouterControlPlane(db, sql, logger);`);
-    if (!output.routines.includes(imported("reconcileOpenRouterControlPlane"))) {
-      output.routines = imported("reconcileOpenRouterControlPlane") + output.routines;
+            await reconcileOpenRouterControlPlaneSafely(db, sql, logger);`);
+    if (!output.routines.includes(imported("reconcileOpenRouterControlPlaneSafely"))) {
+      output.routines = imported("reconcileOpenRouterControlPlaneSafely") + output.routines;
     }
   }
   output.recovery = replaceOnce(output.recovery,
