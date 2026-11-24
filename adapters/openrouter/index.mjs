@@ -203,12 +203,12 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
     if (model.cost.input !== 0 || model.cost.output !== 0) {
       throw new Error("OpenRouter's free router no longer reports zero pricing; refusing paid inference.");
     }
-    const maxOutputTokens = positiveInt(config.maxOutputTokens, "OpenRouter maxOutputTokens", 4096);
+    const maxOutputTokens = positiveInt(config.maxOutputTokens, "OpenRouter maxOutputTokens", 2048);
     model.maxTokens = Math.min(model.maxTokens, maxOutputTokens);
     const thinking = "off";
     const profile = config.profile ?? "standard";
     if (!["standard", "compact"].includes(profile)) throw new Error("OpenRouter profile must be standard or compact.");
-    const defaultTimeoutSec = profile === "compact" ? 600 : 300;
+    const defaultTimeoutSec = profile === "compact" ? 600 : 240;
     const timeoutSec = config.timeoutSec === 0 ? defaultTimeoutSec : (config.timeoutSec ?? defaultTimeoutSec);
     if (typeof timeoutSec !== "number" || !Number.isFinite(timeoutSec) || timeoutSec <= 0) {
       throw new Error("OpenRouter timeoutSec must be a positive number.");
@@ -248,8 +248,8 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
       compact,
       issueId: ctx.context?.taskId || ctx.context?.issueId,
       verificationCommand: config.verificationCommand?.trim(),
-      maxToolCalls: positiveInt(config.maxToolCalls, "OpenRouter maxToolCalls", 30),
-      maxRunInputTokens: positiveInt(config.maxRunInputTokens, "OpenRouter maxRunInputTokens", 80_000),
+      maxToolCalls: positiveInt(config.maxToolCalls, "OpenRouter maxToolCalls", 20),
+      maxRunInputTokens: positiveInt(config.maxRunInputTokens, "OpenRouter maxRunInputTokens", 50_000),
     };
   }
 
@@ -402,13 +402,13 @@ export function createServerAdapter({ runtime = piRuntime, fetchImpl = fetch, mi
             options: [{ value: "standard", label: "Standard" }, { value: "compact", label: "Compact (issue runs)" }] },
           { key: "verificationCommand", label: "Compact verification command", type: "text",
             hint: "Operator-reviewed shell check. Compact tools cannot mark done without a passing check." },
-          { key: "maxToolCalls", label: "Compact tool-call budget", type: "number", default: 30 },
-          { key: "maxRunInputTokens", label: "Compact input-token budget per attempt", type: "number", default: 80000 },
+          { key: "maxToolCalls", label: "Compact tool-call budget", type: "number", default: 20 },
+          { key: "maxRunInputTokens", label: "Compact input-token budget per attempt", type: "number", default: 50000 },
           { key: "cwd", label: "Working directory", type: "text" },
           { key: "instructionsFilePath", label: "Instructions file", type: "text" },
           { key: "promptTemplate", label: "Prompt template", type: "textarea" },
-          { key: "timeoutSec", label: "Run timeout (seconds)", type: "number", hint: "Defaults: standard 300s, compact 600s." },
-          { key: "maxOutputTokens", label: "Maximum output tokens per turn", type: "number", default: 4096 },
+          { key: "timeoutSec", label: "Run timeout (seconds)", type: "number", hint: "Defaults: standard 240s, compact 600s." },
+          { key: "maxOutputTokens", label: "Maximum output tokens per turn", type: "number", default: 2048 },
           { key: "graceSec", label: "Termination grace (seconds)", type: "number", default: 20 },
         ],
       };

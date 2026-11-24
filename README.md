@@ -54,12 +54,28 @@ each exhausted lane until its quota window or for at most one hour.
   Google project ever gets billing, Gemini lanes switch off automatically.
 - **Global gate:** when every lane is cooling down, queued runs stay queued
   instead of burning retries. Dispatch resumes automatically once a lane recovers.
+- **Fair concurrency:** dispatch defaults to four workers, reserves at least one
+  worker for every active company with queued work, round-robins companies and
+  agents, and spreads concurrent requests across distinct provider lanes.
+  Three quota errors in ten minutes throttle concurrency back to one worker per
+  queued company until the provider settles.
 - **Secrets:** Pi receives only a per-run gateway token. The real OpenRouter and
   Gemini keys are not passed to Pi or its tool subprocesses.
 - **Privacy:** Google may use free-tier Gemini prompts to improve its products.
   Set `PAPERCLIP_FREE_POOL=0` to disable the gateway, or `FREE_POOL_GEMINI=0` to
   keep OpenRouter only. `FREE_POOL_GEMINI_MODELS` overrides the Gemini lane list
   (comma-separated). Gateway telemetry is logged as JSON with `"tag":"freepool"`.
+
+The served UI injects a read-only queue badge on company, agent, task and run
+pages. It shows the current org/agent position, retry or quota wait, and
+estimated wait from recent successful run duration. Queue inspection is exposed
+through authenticated `GET /api/companies/:companyId/openrouter-queue`.
+
+The control-plane sweep permanently removes the exact obsolete model-routing
+routine IDs recorded in `scripts/openrouter-recovery.mjs`, cancels stale,
+duplicate or no-longer-actionable queued wakeups, and defers routine triggers
+when an assignee already has more than two queued runs or a run older than 24
+hours. Similar future routines are not deleted by a broad name match.
 
 ### Permanent hourly recovery
 

@@ -120,7 +120,7 @@ test("adapter routes exclusively to OpenRouter and preserves lifecycle, session 
       assert.equal(providers.openrouter.models[0].maxTokens, 256);
       assert.equal(providers.openrouter.models[1].maxTokens, 256);
       assert.equal(providers.openrouter.models[0].contextWindow, 128_000);
-      assert.equal(ctx.config.timeoutSec, 300);
+      assert.equal(ctx.config.timeoutSec, 240);
       await ctx.onMeta({ adapterType: "pi_local", command: "pi" });
       await ctx.onUsage(usage);
       return result;
@@ -248,7 +248,7 @@ test("Paperclip's zero timeout sentinel uses the bounded profile default", async
     });
     assert.equal(result.exitCode, 0, result.errorMessage);
   }
-  assert.deepEqual(timeouts, [300, 600, 45]);
+  assert.deepEqual(timeouts, [240, 600, 45]);
 });
 
 test("environment probe reports the OpenRouter adapter identity and prepared provider config", async () => {
@@ -327,7 +327,7 @@ test("start pacing spaces concurrent OpenRouter runs and honors abort signals wh
     },
   });
   const abortController = new AbortController();
-  setTimeout(() => abortController.abort(), 15);
+  setTimeout(() => abortController.abort(), 35);
   const [r1, r2, r3] = await Promise.all([
     adapter.execute({ config: { env: { OPENROUTER_API_KEY: fakeKey } }, onLog: async () => {} }),
     adapter.execute({ config: { env: { OPENROUTER_API_KEY: fakeKey } }, onLog: async () => {} }),

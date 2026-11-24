@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   limitOpenRouterAvailableSlots,
+  listOpenRouterQueue,
+  OBSOLETE_ROUTINE_IDS,
   openRouterLocalTerminationProof,
   openRouterRetryOptions,
   orderQueuedAgentIds,
@@ -60,6 +62,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
     lifecycle: readFileSync(new URL("../node_modules/@paperclipai/server/dist/modules/agent-lifecycle/adapters/postgres.js", import.meta.url), "utf8"),
     runControl: readFileSync(new URL(`${server}heartbeat/run-control.js`, import.meta.url), "utf8"),
     routines: readFileSync(new URL(`${server}routines.js`, import.meta.url), "utf8"),
+    agentsRoutes: readFileSync(new URL(`${server}../routes/agents.js`, import.meta.url), "utf8"),
   };
   const patched = patchOpenRouterSources(sources);
   assert.deepEqual(patchOpenRouterSources(patched), patched);
@@ -82,6 +85,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
   assert.match(patched.queue, /limitOpenRouterAvailableSlots\(db, agent,/);
   assert.match(patched.queue, /triggerOpenRouterQueueDrain\(\(\) => resumeQueuedRunsAfterDrain\(\), logger\)/);
   assert.match(patched.routines, /await reconcileOpenRouterControlPlaneSafely\(db, sql, logger\)/);
+  assert.match(patched.agentsRoutes, /openrouter-queue/);
   assert.match(patched.pi, /retry: \{ enabled: false, maxRetries: 0, provider: \{ maxRetries: 0 \} \}/);
   assert.match(patched.piExecute, /localSystemPromptPath/);
   assert.match(patched.piExecute, /stdin: !executionTargetIsRemote && userPrompt\.trim\(\)\.length > 0/);
@@ -126,12 +130,16 @@ test("control-plane cleanup uses SQL predicates instead of Drizzle UUID array in
   };
   const result = await reconcileOpenRouterControlPlane(fakeDb, sqlTag, { info() {} });
   assert.equal(result.detachedRunsRecovered, 1);
-  assert.equal(result.routinesPaused, 1);
+  assert.equal(result.routinesPaused, 0);
+  assert.equal(result.routinesDeleted, 0);
   assert.ok(queries.some(query => query.text.includes("with stale_detached as")));
   assert.ok(queries.some(query => query.text.includes("update routine_triggers")));
   assert.ok(queries.some(query => query.text.includes("update routines")));
   assert.ok(queries.some(query => query.text.includes("cancel_routine_runs as")));
+  assert.ok(queries.some(query => query.text.includes("delete from routines")));
+  assert.ok(queries.some(query => query.values.includes(OBSOLETE_ROUTINE_IDS[4])));
   assert.doesNotMatch(queries.map(query => query.text).join("\n"), /any\(\?/);
+  assert.doesNotMatch(queries.map(query => query.text).join("\n"), /lower\(coalesce\(r\.title[\s\S]*?~ \?/);
   assert.equal(queries.some(query => query.values.some(Array.isArray)), false);
 });
 
@@ -151,6 +159,9 @@ test("control-plane cleanup failure cannot block scheduler or retry recovery", a
     policiesHealed: 0,
     routinesPaused: 0,
     issuesCancelled: 0,
+    staleRunsCancelled: 0,
+    routinesDeleted: 0,
+    routinesDeferred: 0,
   });
   assert.equal(errors.length, 1);
   assert.equal(errors[0].payload.tag, "openrouter.reconcile.control_plane_error");
@@ -195,10 +206,10 @@ test("OpenRouter global concurrency lock, slot cap, and drain coalescer prevent 
   const orAgent = { adapterType: "openrouter" };
   const otherAgent = { adapterType: "codex_local" };
 
-  assert.equal(await limitOpenRouterAvailableSlots(fakeDb, orAgent, 3, sqlTag, {}), 1);
+  assert.equal(await limitOpenRouterAvailableSlots(fakeDb, orAgent, 3, sqlTag, {}), 3);
   activeCount = 2;
-  assert.equal(await limitOpenRouterAvailableSlots(fakeDb, orAgent, 3, sqlTag, {}), 0);
-  assert.equal(await limitOpenRouterAvailableSlots(fakeDb, orAgent, 3, sqlTag, { OPENROUTER_MAX_CONCURRENT_RUNS: "4" }), 2);
+  assert.equal(await limitOpenRouterAvailableSlots(fakeDb, orAgent, 3, sqlTag, {}), 2);
+  assert.equal(await limitOpenRouterAvailableSlots(fakeDb, orAgent, 3, sqlTag, { OPENROUTER_MAX_CONCURRENT_RUNS: "6" }), 3);
   assert.equal(await limitOpenRouterAvailableSlots(fakeDb, otherAgent, 3, sqlTag, {}), 3);
 
   const events = [];
@@ -249,6 +260,46 @@ test("OpenRouter global concurrency lock, slot cap, and drain coalescer prevent 
   assert.deepEqual(new Set(fair.slice(0, 2)).size, 2);
 });
 
+test("OpenRouter reserves one worker per queued company and throttles after quota bursts", async () => {
+  let state = {
+    running_global: 1,
+    queued_companies: 2,
+    running_company: 1,
+    unserved_other_companies: 1,
+    recent_quota_failures: 0,
+  };
+  const db = { async execute() { return { rows: [state] }; } };
+  const sql = (strings, ...values) => ({ strings, values });
+  const agent = { adapterType: "openrouter", companyId: "company-a" };
+  assert.equal(await limitOpenRouterAvailableSlots(db, agent, 1, sql, {}), 0);
+  state = { ...state, running_company: 0, unserved_other_companies: 0 };
+  assert.equal(await limitOpenRouterAvailableSlots(db, agent, 2, sql, {}), 2);
+  state = { ...state, running_global: 1, queued_companies: 2, recent_quota_failures: 3 };
+  assert.equal(await limitOpenRouterAvailableSlots(db, agent, 2, sql, {}), 1);
+});
+
+test("OpenRouter queue endpoint returns per-company and per-agent positions", async () => {
+  const now = new Date("2026-11-24T12:00:00Z");
+  const db = {
+    async execute() {
+      return {
+        rows: [
+          { id: "running", status: "running", company_id: "c1", agent_id: "a1", agent_name: "A", created_at: now, median_duration_ms: 1000 },
+          { id: "queued-a", status: "queued", company_id: "c1", agent_id: "a1", agent_name: "A", created_at: now, median_duration_ms: 2000, issue_identifier: "FE-1" },
+          { id: "queued-b", status: "queued", company_id: "c1", agent_id: "a2", agent_name: "B", created_at: now, median_duration_ms: 3000 },
+        ],
+      };
+    },
+  };
+  const queue = await listOpenRouterQueue(db, "c1", (strings, ...values) => ({ strings, values }));
+  assert.equal(queue.queuedCount, 2);
+  assert.equal(queue.runs[0].position, 0);
+  assert.equal(queue.runs[1].position, 1);
+  assert.equal(queue.runs[1].agentPosition, 1);
+  assert.equal(queue.runs[2].position, 2);
+  assert.equal(OBSOLETE_ROUTINE_IDS.length, 5);
+});
+
 test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready agents, and wakes queue dispatch", async () => {
   const scheduledLifecycles = [];
   const reconciledAgents = [];
@@ -266,6 +317,10 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
       if (query.text.includes("budget_monthly_cents")) return { rows: [] };
       if (query.text.includes("from routines r")) return { rows: [] };
       if (query.text.includes("with target_issues as")) return { rows: [] };
+      if (query.text.includes("with queued as")) return { rows: [] };
+      if (query.text.includes("set cron_expression = case")) return { rows: [] };
+      if (query.text.includes("deferred_openrouter_backlog")) return { rows: [] };
+      if (query.text.includes("delete from routines")) return { rows: [] };
       if (query.text.includes("count(distinct a.id)")) return { rows: [] };
       if (query.text.includes("set status = 'idle'")) return { rows: [{ id: "agent-healed-1" }] };
       if (query.text.includes("and a.lifecycle_state = 'paused'")) return { rows: [{ id: "agent-paused-1" }] };

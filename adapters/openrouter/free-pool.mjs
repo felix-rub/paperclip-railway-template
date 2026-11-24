@@ -100,6 +100,9 @@ export function classifyFailure(lane, status, text, headers, now = Date.now()) {
   if (status === 404) {
     return { failover: true, cooldownUntil: now + MAX_COOLDOWN_MS, reason: "model_unavailable", message };
   }
+  if (status === 400 && /MALFORMED_FUNCTION_CALL|function_call_filter/i.test(text)) {
+    return { failover: true, cooldownUntil: now + TRANSIENT_COOLDOWN_MS, reason: "malformed_tool_call", message };
+  }
   if (status === 408 || status >= 500) {
     return { failover: true, cooldownUntil: now + TRANSIENT_COOLDOWN_MS, reason: "overloaded", message };
   }
@@ -194,13 +197,14 @@ export function createFreePool({
     ...(geminiKey && env.FREE_POOL_GEMINI !== "0"
       ? geminiModels.map(model => ({ id: `gemini/${model}`, provider: "gemini", model })) : []),
     { id: "openrouter/free", provider: "openrouter", model: "openrouter/free" },
-  ].map(lane => ({ ...lane, cooldownUntil: 0, reason: null, ok: 0, failed: 0 }));
+  ].map(lane => ({ ...lane, cooldownUntil: 0, reason: null, ok: 0, failed: 0, busy: false }));
   const tokens = new Map();
   const signatures = createSignatureCache();
   const tier = { state: geminiKey ? "unverified" : "absent", checkedAt: 0, inFlight: null };
   let server = null;
   let listening = null;
   let baseUrl = null;
+  let laneCursor = 0;
 
   function emit(entry) {
     try { log({ tag: "freepool", ...entry }); } catch { /* never fail on logging */ }
@@ -241,9 +245,13 @@ export function createFreePool({
 
   function availableLanes(preferred) {
     const t = now();
-    const ready = lanes.filter(lane => laneEnabled(lane) && lane.cooldownUntil <= t);
+    const ready = lanes.filter(lane => laneEnabled(lane) && lane.cooldownUntil <= t && !lane.busy);
     const sticky = ready.find(lane => lane.id === preferred);
-    return sticky ? [sticky, ...ready.filter(lane => lane !== sticky)] : ready;
+    if (sticky) return [sticky, ...ready.filter(lane => lane !== sticky)];
+    if (ready.length <= 1) return ready;
+    const offset = laneCursor % ready.length;
+    laneCursor = (laneCursor + 1) % 1_000_000;
+    return [...ready.slice(offset), ...ready.slice(0, offset)];
   }
 
   function exhaustedUntil() {
@@ -327,6 +335,7 @@ export function createFreePool({
     for (;;) {
     for (const lane of availableLanes(grant.lane)) {
       if (clientAbort.signal.aborted) return res.end();
+      lane.busy = true;
       const started = now();
       const upstream = upstreamRequest(lane, body, grant, req.headers);
       const headerTimer = new AbortController();
@@ -342,6 +351,7 @@ export function createFreePool({
         });
       } catch (error) {
         clearTimeout(timer);
+        lane.busy = false;
         if (clientAbort.signal.aborted) return res.end();
         const verdict = { failover: true, cooldownUntil: now() + TRANSIENT_COOLDOWN_MS, reason: "network",
           message: String(error?.message ?? error).slice(0, 200) };
@@ -354,6 +364,7 @@ export function createFreePool({
       if (!response.ok) {
         const text = await response.text().catch(() => "");
         const verdict = classifyFailure(lane, response.status, text, response.headers, now());
+        lane.busy = false;
         attempted.push(`${lane.id}:${response.status}`);
         lastFailure = { status: response.status, message: verdict.message };
         if (verdict.failover) {
@@ -392,6 +403,7 @@ export function createFreePool({
       } catch (error) {
         emit({ event: "stream_error", runId: grant.runId, lane: lane.id, message: String(error?.message ?? error).slice(0, 200) });
       }
+      lane.busy = false;
       res.end();
       emit({ event: "request", runId: grant.runId, agentId: grant.agentId, lane: lane.id, status: 200,
         ms: now() - started, attempted });
@@ -399,7 +411,8 @@ export function createFreePool({
     }
     // Per-minute limits clear quickly; hold the request instead of failing the run
     // (which would push it to the next hourly retry).
-    const nextFree = exhaustedUntil();
+    const busyLane = lanes.some(lane => laneEnabled(lane) && lane.cooldownUntil <= now() && lane.busy);
+    const nextFree = exhaustedUntil() || (busyLane ? now() + 250 : 0);
     if (!nextFree || nextFree > waitDeadline || clientAbort.signal.aborted) break;
     emit({ event: "waiting", runId: grant.runId, until: new Date(nextFree).toISOString() });
     await sleep(Math.max(0, nextFree - now()) + 250, clientAbort.signal);

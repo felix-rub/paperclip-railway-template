@@ -3,12 +3,31 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 export const OPENROUTER_RETRY_MS = 60 * 60 * 1000;
-export const DEFAULT_OPENROUTER_MAX_CONCURRENT_RUNS = 2;
+export const DEFAULT_OPENROUTER_MAX_CONCURRENT_RUNS = 4;
+const OPENROUTER_QUOTA_THROTTLE_FAILURES = 3;
 const DEFAULT_SWEEP_BATCH_LIMIT = 25;
 const DEFAULT_DIRECT_SWEEP_LIMIT = 200;
 const DEFAULT_SWEEP_INITIAL_DELAY_MS = 2_000;
 const DEFAULT_SWEEP_CONTINUATION_DELAY_MS = 2_000;
 const DEFAULT_SWEEP_MIN_INTERVAL_MS = 60_000;
+export const OBSOLETE_ROUTINE_IDS = [
+  "637646eb-ec76-4ade-b375-8be0eea94a78",
+  "c360cccc-2de7-465e-9073-5f28565dc064",
+  "e8c2dbe3-0a57-4a0c-b527-ef9a36de63b5",
+  "23deafef-15aa-4b13-bace-1bba09b553e8",
+  "e5c0612a-68ab-42eb-9b36-347ed36d7662",
+];
+const RETIRED_DAILY_ROUTINE_IDS = [
+  "5cdb030a-715b-49a3-9b38-519ac7a8446e",
+  "45e6e1a1-fdf3-4c38-a543-fbd2d9632e40",
+  "ee5619a5-c8d6-4cf8-a4a9-4214c1770dcb",
+  "0b990ff4-33fb-4f35-b4c8-99f2e630377b",
+  "58742868-1027-4e26-80ff-9ded26e7b236",
+  "0898de2f-0298-4be6-8b3b-a6542b60267c",
+  "c1c52c3b-a3cd-41f9-8fd8-5420aacb51e3",
+  "166f9031-9fd1-4d7c-b625-c58ec2adaa82",
+  "bed9b44b-63c6-4b3d-badb-3b7f89547049",
+];
 
 export function resolveOpenRouterMaxConcurrentRuns(env = process.env) {
   const raw = env?.OPENROUTER_MAX_CONCURRENT_RUNS;
@@ -38,18 +57,76 @@ export async function limitOpenRouterAvailableSlots(db, agent, availableSlots, s
   // Every free lane is cooling down: keep queued runs queued instead of burning
   // them on guaranteed quota failures. The sweep re-dispatches once a lane reopens.
   if (freePoolExhaustedUntil()) return 0;
-  const globalMax = resolveOpenRouterMaxConcurrentRuns(env);
+  const configuredMax = resolveOpenRouterMaxConcurrentRuns(env);
   const result = await db.execute(sql`
-    select count(*)::int as count
-    from heartbeat_runs r
-    join agents a on a.id = r.agent_id and a.company_id = r.company_id
-    where r.status = 'running'
-      and a.adapter_type = 'openrouter'
+    select
+      (
+        select count(*)::int
+        from heartbeat_runs r
+        join agents a on a.id = r.agent_id and a.company_id = r.company_id
+        where r.status = 'running' and a.adapter_type = 'openrouter'
+      ) as running_global,
+      (
+        select count(distinct r.company_id)::int
+        from heartbeat_runs r
+        join agents a on a.id = r.agent_id and a.company_id = r.company_id
+        join companies c on c.id = r.company_id and c.status = 'active'
+        where r.status = 'queued' and a.adapter_type = 'openrouter'
+      ) as queued_companies,
+      (
+        select count(*)::int
+        from heartbeat_runs r
+        join agents a on a.id = r.agent_id and a.company_id = r.company_id
+        where r.status = 'running'
+          and a.adapter_type = 'openrouter'
+          and r.company_id = ${agent.companyId}
+      ) as running_company,
+      (
+        select count(distinct queued.company_id)::int
+        from heartbeat_runs queued
+        join agents a on a.id = queued.agent_id and a.company_id = queued.company_id
+        join companies c on c.id = queued.company_id and c.status = 'active'
+        where queued.status = 'queued'
+          and a.adapter_type = 'openrouter'
+          and queued.company_id <> ${agent.companyId}
+          and not exists (
+            select 1
+            from heartbeat_runs running
+            join agents running_agent
+              on running_agent.id = running.agent_id
+             and running_agent.company_id = running.company_id
+            where running.company_id = queued.company_id
+              and running.status = 'running'
+              and running_agent.adapter_type = 'openrouter'
+          )
+      ) as unserved_other_companies,
+      (
+        select count(*)::int
+        from heartbeat_runs r
+        join agents a on a.id = r.agent_id and a.company_id = r.company_id
+        where r.status in ('failed', 'timed_out', 'interrupted')
+          and a.adapter_type = 'openrouter'
+          and r.finished_at > now() - interval '10 minutes'
+          and (
+            coalesce(r.error, '') ~* '(429|rate limit|high demand|free-models-per-day|quota)'
+            or coalesce(r.error_code, '') = 'native_provider_overloaded'
+          )
+      ) as recent_quota_failures
   `);
   const rows = result.rows ?? result;
   if (!Array.isArray(rows)) throw new Error("Unexpected OpenRouter concurrency query result.");
-  const runningGlobal = Number(rows[0]?.count ?? 0);
-  return Math.max(0, Math.min(availableSlots, globalMax - runningGlobal));
+  const row = rows[0] ?? {};
+  const runningGlobal = Number(row.running_global ?? row.count ?? 0);
+  const queuedCompanies = Number(row.queued_companies ?? 0);
+  const runningCompany = Number(row.running_company ?? 0);
+  const unservedOthers = Number(row.unserved_other_companies ?? 0);
+  const recentQuotaFailures = Number(row.recent_quota_failures ?? 0);
+  const minimumPerCompanyCap = Math.max(queuedCompanies, 1);
+  const effectiveGlobalMax = recentQuotaFailures >= OPENROUTER_QUOTA_THROTTLE_FAILURES
+    ? minimumPerCompanyCap
+    : Math.max(configuredMax, minimumPerCompanyCap);
+  if (runningCompany > 0 && unservedOthers > 0) return 0;
+  return Math.max(0, Math.min(availableSlots, effectiveGlobalMax - runningGlobal));
 }
 
 let drainInFlight = false;
@@ -315,6 +392,111 @@ export async function hasOpenRouterHourlyWait(db, agent, sql) {
   return rows.length > 0;
 }
 
+export async function listOpenRouterQueue(db, companyId, sql) {
+  const result = await db.execute(sql`
+    with candidates as (
+      select
+        r.id,
+        r.company_id,
+        r.agent_id,
+        a.name as agent_name,
+        r.status,
+        r.created_at,
+        r.started_at,
+        r.scheduled_retry_at,
+        r.issue_id,
+        i.identifier as issue_identifier,
+        i.title as issue_title,
+        case r.status
+          when 'running' then 0
+          when 'queued' then 1
+          else 2
+        end as state_rank,
+        case i.priority
+          when 'critical' then 0
+          when 'high' then 1
+          when 'medium' then 2
+          when 'low' then 3
+          else 4
+        end as priority_rank
+      from heartbeat_runs r
+      join agents a on a.id = r.agent_id and a.company_id = r.company_id
+      left join issues i on i.company_id = r.company_id
+        and i.id::text = nullif(coalesce(r.issue_id::text, r.context_snapshot ->> 'issueId'), '')
+      where r.company_id = ${companyId}
+        and a.adapter_type = 'openrouter'
+        and r.status in ('queued', 'running', 'scheduled_retry')
+    ),
+    ordered as (
+      select c.*,
+        row_number() over (
+          order by c.state_rank, c.priority_rank,
+            coalesce(c.scheduled_retry_at, c.created_at), c.created_at, c.id
+        )::int as overall_position,
+        row_number() over (
+          partition by c.agent_id
+          order by c.state_rank, c.priority_rank,
+            coalesce(c.scheduled_retry_at, c.created_at), c.created_at, c.id
+        )::int as agent_position,
+        (
+          select coalesce(
+            percentile_cont(0.5) within group (
+              order by extract(epoch from (finished_at - started_at)) * 1000
+            ),
+            300000
+          )::int
+          from heartbeat_runs duration
+          where duration.company_id = ${companyId}
+            and duration.agent_id = c.agent_id
+            and duration.status = 'succeeded'
+            and duration.started_at is not null
+            and duration.finished_at is not null
+            and duration.finished_at > now() - interval '24 hours'
+        ) as median_duration_ms
+      from candidates c
+    )
+    select * from ordered
+    order by overall_position
+  `);
+  const rows = result.rows ?? result;
+  if (!Array.isArray(rows)) throw new Error("Unexpected OpenRouter queue query result.");
+  const cooldownUntil = freePoolExhaustedUntil();
+  const runningCount = rows.filter(row => row.status === "running").length;
+  const queuePositions = new Map();
+  const agentPositions = new Map();
+  const agentCounts = new Map();
+  for (const row of rows) {
+    if (row.status === "running") continue;
+    queuePositions.set(row.id, queuePositions.size + 1);
+    const next = (agentCounts.get(row.agent_id) ?? 0) + 1;
+    agentCounts.set(row.agent_id, next);
+    agentPositions.set(row.id, next);
+  }
+  return {
+    generatedAt: new Date().toISOString(),
+    workerCount: resolveOpenRouterMaxConcurrentRuns(),
+    runningCount,
+    quotaCooldownUntil: cooldownUntil ? new Date(cooldownUntil).toISOString() : null,
+    queuedCount: rows.filter(row => row.status !== "running").length,
+    runs: rows.map(row => ({
+      id: row.id,
+      companyId: row.company_id,
+      agentId: row.agent_id,
+      agentName: row.agent_name,
+      status: row.status,
+      position: row.status === "running" ? 0 : Number(queuePositions.get(row.id) ?? 0),
+      agentPosition: row.status === "running" ? 0 : Number(agentPositions.get(row.id) ?? 0),
+      queuedAt: row.created_at,
+      startedAt: row.started_at,
+      scheduledRetryAt: row.scheduled_retry_at,
+      issueId: row.issue_id,
+      issueIdentifier: row.issue_identifier,
+      issueTitle: row.issue_title,
+      medianDurationMs: Number(row.median_duration_ms ?? 300_000),
+    })),
+  };
+}
+
 const bootUnparkedDbs = new WeakSet();
 const stateLogTimestamps = new WeakMap();
 const STATE_LOG_INTERVAL_MS = 5 * 60_000;
@@ -428,20 +610,42 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
       and coalesce(a.budget_monthly_cents, 0) < 10000
   `);
 
-  const routineMatch = `(model|openrouter|gemini|free[- ]model|provider)[^\\n]{0,100}(switch|watch|monitor|rotat|fallback|migrat|audit)|(switch|watch|monitor|rotat|fallback|migrat|audit)[^\\n]{0,100}(model|openrouter|gemini|free[- ]model|provider)`;
   const targetRes = await db.execute(sql`
     select r.id, r.company_id, r.title,
       case
-        when lower(coalesce(r.title, '') || ' ' || coalesce(r.description, '')) ~ ${routineMatch}
-          then 'obsolete_model_automation'
+        when r.id::text in (
+          ${OBSOLETE_ROUTINE_IDS[0]}, ${OBSOLETE_ROUTINE_IDS[1]},
+          ${OBSOLETE_ROUTINE_IDS[2]}, ${OBSOLETE_ROUTINE_IDS[3]},
+          ${OBSOLETE_ROUTINE_IDS[4]}
+        ) then 'obsolete_model_automation'
+        when r.id::text in (
+          ${RETIRED_DAILY_ROUTINE_IDS[0]}, ${RETIRED_DAILY_ROUTINE_IDS[1]},
+          ${RETIRED_DAILY_ROUTINE_IDS[2]}, ${RETIRED_DAILY_ROUTINE_IDS[3]},
+          ${RETIRED_DAILY_ROUTINE_IDS[4]}, ${RETIRED_DAILY_ROUTINE_IDS[5]},
+          ${RETIRED_DAILY_ROUTINE_IDS[6]}, ${RETIRED_DAILY_ROUTINE_IDS[7]},
+          ${RETIRED_DAILY_ROUTINE_IDS[8]}
+        ) then 'retired_daily_planning'
         else 'terminated_assignee'
       end as reason
     from routines r
     join companies c on c.id = r.company_id and c.status = 'active'
     left join agents a on a.id = r.assignee_agent_id and a.company_id = r.company_id
-    where r.status = 'active'
+    where (r.status = 'active' or r.id::text in (
+        ${OBSOLETE_ROUTINE_IDS[0]}, ${OBSOLETE_ROUTINE_IDS[1]},
+        ${OBSOLETE_ROUTINE_IDS[2]}, ${OBSOLETE_ROUTINE_IDS[3]},
+        ${OBSOLETE_ROUTINE_IDS[4]}
+      ))
       and (
-        lower(coalesce(r.title, '') || ' ' || coalesce(r.description, '')) ~ ${routineMatch}
+        r.id::text in (
+          ${OBSOLETE_ROUTINE_IDS[0]}, ${OBSOLETE_ROUTINE_IDS[1]},
+          ${OBSOLETE_ROUTINE_IDS[2]}, ${OBSOLETE_ROUTINE_IDS[3]},
+          ${OBSOLETE_ROUTINE_IDS[4]},
+          ${RETIRED_DAILY_ROUTINE_IDS[0]}, ${RETIRED_DAILY_ROUTINE_IDS[1]},
+          ${RETIRED_DAILY_ROUTINE_IDS[2]}, ${RETIRED_DAILY_ROUTINE_IDS[3]},
+          ${RETIRED_DAILY_ROUTINE_IDS[4]}, ${RETIRED_DAILY_ROUTINE_IDS[5]},
+          ${RETIRED_DAILY_ROUTINE_IDS[6]}, ${RETIRED_DAILY_ROUTINE_IDS[7]},
+          ${RETIRED_DAILY_ROUTINE_IDS[8]}
+        )
         or a.status = 'terminated' or a.lifecycle_state = 'terminated'
       )
     order by r.company_id, r.id
@@ -458,9 +662,17 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
         join companies c on c.id = r.company_id and c.status = 'active'
         left join agents a on a.id = r.assignee_agent_id and a.company_id = r.company_id
         where r.id = routine_triggers.routine_id
-          and r.status = 'active'
           and (
-            lower(coalesce(r.title, '') || ' ' || coalesce(r.description, '')) ~ ${routineMatch}
+            r.id::text in (
+              ${OBSOLETE_ROUTINE_IDS[0]}, ${OBSOLETE_ROUTINE_IDS[1]},
+              ${OBSOLETE_ROUTINE_IDS[2]}, ${OBSOLETE_ROUTINE_IDS[3]},
+              ${OBSOLETE_ROUTINE_IDS[4]},
+              ${RETIRED_DAILY_ROUTINE_IDS[0]}, ${RETIRED_DAILY_ROUTINE_IDS[1]},
+              ${RETIRED_DAILY_ROUTINE_IDS[2]}, ${RETIRED_DAILY_ROUTINE_IDS[3]},
+              ${RETIRED_DAILY_ROUTINE_IDS[4]}, ${RETIRED_DAILY_ROUTINE_IDS[5]},
+              ${RETIRED_DAILY_ROUTINE_IDS[6]}, ${RETIRED_DAILY_ROUTINE_IDS[7]},
+              ${RETIRED_DAILY_ROUTINE_IDS[8]}
+            )
             or a.status = 'terminated'
             or a.lifecycle_state = 'terminated'
           )
@@ -472,7 +684,13 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
       where status = 'active'
         and exists (select 1 from companies c where c.id = routines.company_id and c.status = 'active')
         and (
-          lower(coalesce(title, '') || ' ' || coalesce(description, '')) ~ ${routineMatch}
+          id::text in (
+            ${RETIRED_DAILY_ROUTINE_IDS[0]}, ${RETIRED_DAILY_ROUTINE_IDS[1]},
+            ${RETIRED_DAILY_ROUTINE_IDS[2]}, ${RETIRED_DAILY_ROUTINE_IDS[3]},
+            ${RETIRED_DAILY_ROUTINE_IDS[4]}, ${RETIRED_DAILY_ROUTINE_IDS[5]},
+            ${RETIRED_DAILY_ROUTINE_IDS[6]}, ${RETIRED_DAILY_ROUTINE_IDS[7]},
+            ${RETIRED_DAILY_ROUTINE_IDS[8]}
+          )
           or exists (
             select 1 from agents a
             where a.id = routines.assignee_agent_id
@@ -496,7 +714,7 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
       where i.status not in ('done', 'cancelled')
         and exists (select 1 from companies c where c.id = i.company_id and c.status = 'active')
         and (
-          lower(coalesce(i.title, '') || ' ' || coalesce(i.description, '')) ~ ${routineMatch}
+          lower(coalesce(i.title, '')) ~ '^review productivity for '
           or (
             i.origin_kind = 'routine_execution'
             and exists (
@@ -508,7 +726,16 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
               where source_routine.company_id = i.company_id
                 and source_routine.id::text = i.origin_id
                 and (
-                  lower(coalesce(source_routine.title, '') || ' ' || coalesce(source_routine.description, '')) ~ ${routineMatch}
+                  source_routine.id::text in (
+                    ${OBSOLETE_ROUTINE_IDS[0]}, ${OBSOLETE_ROUTINE_IDS[1]},
+                    ${OBSOLETE_ROUTINE_IDS[2]}, ${OBSOLETE_ROUTINE_IDS[3]},
+                    ${OBSOLETE_ROUTINE_IDS[4]},
+                    ${RETIRED_DAILY_ROUTINE_IDS[0]}, ${RETIRED_DAILY_ROUTINE_IDS[1]},
+                    ${RETIRED_DAILY_ROUTINE_IDS[2]}, ${RETIRED_DAILY_ROUTINE_IDS[3]},
+                    ${RETIRED_DAILY_ROUTINE_IDS[4]}, ${RETIRED_DAILY_ROUTINE_IDS[5]},
+                    ${RETIRED_DAILY_ROUTINE_IDS[6]}, ${RETIRED_DAILY_ROUTINE_IDS[7]},
+                    ${RETIRED_DAILY_ROUTINE_IDS[8]}
+                  )
                   or source_agent.status = 'terminated'
                   or source_agent.lifecycle_state = 'terminated'
                 )
@@ -557,7 +784,16 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
             where source_routine.id = rr.routine_id
               and source_routine.company_id = rr.company_id
               and (
-                lower(coalesce(source_routine.title, '') || ' ' || coalesce(source_routine.description, '')) ~ ${routineMatch}
+                source_routine.id::text in (
+                  ${OBSOLETE_ROUTINE_IDS[0]}, ${OBSOLETE_ROUTINE_IDS[1]},
+                  ${OBSOLETE_ROUTINE_IDS[2]}, ${OBSOLETE_ROUTINE_IDS[3]},
+                  ${OBSOLETE_ROUTINE_IDS[4]},
+                  ${RETIRED_DAILY_ROUTINE_IDS[0]}, ${RETIRED_DAILY_ROUTINE_IDS[1]},
+                  ${RETIRED_DAILY_ROUTINE_IDS[2]}, ${RETIRED_DAILY_ROUTINE_IDS[3]},
+                  ${RETIRED_DAILY_ROUTINE_IDS[4]}, ${RETIRED_DAILY_ROUTINE_IDS[5]},
+                  ${RETIRED_DAILY_ROUTINE_IDS[6]}, ${RETIRED_DAILY_ROUTINE_IDS[7]},
+                  ${RETIRED_DAILY_ROUTINE_IDS[8]}
+                )
                 or source_agent.status = 'terminated'
                 or source_agent.lifecycle_state = 'terminated'
               )
@@ -569,6 +805,126 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
     select id, company_id, title from target_issues
   `);
   const issues = issueRes.rows ?? issueRes;
+  const staleQueueRes = await db.execute(sql`
+    with queued as (
+      select
+        r.id,
+        r.company_id,
+        r.agent_id,
+        r.wakeup_request_id,
+        row_number() over (
+          partition by r.company_id, r.agent_id,
+            coalesce(r.issue_id::text, nullif(r.context_snapshot ->> 'issueId', ''),
+              r.context_snapshot ->> 'taskKey', r.id::text)
+          order by r.created_at desc, r.id desc
+        ) as duplicate_rank,
+        i.status as issue_status
+      from heartbeat_runs r
+      join agents a on a.id = r.agent_id and a.company_id = r.company_id
+      join companies c on c.id = r.company_id and c.status = 'active'
+      left join issues i on i.company_id = r.company_id
+        and i.id::text = nullif(coalesce(r.issue_id::text, r.context_snapshot ->> 'issueId'), '')
+      where r.status = 'queued'
+        and a.adapter_type = 'openrouter'
+    ),
+    cancelled_runs as (
+      update heartbeat_runs r
+      set status = 'cancelled',
+          error = coalesce(r.error, 'Cancelled stale, duplicate, or no-longer-actionable queued wakeup'),
+          error_code = coalesce(r.error_code, 'operator_interrupted'),
+          finished_at = coalesce(r.finished_at, now()),
+          updated_at = now()
+      from queued q
+      where r.id = q.id
+        and (
+          q.issue_status in ('done', 'cancelled', 'blocked')
+          or q.duplicate_rank > 1
+          or (
+            r.created_at < now() - interval '48 hours'
+            and exists (
+              select 1 from heartbeat_runs newer
+              where newer.company_id = r.company_id
+                and newer.agent_id = r.agent_id
+                and coalesce(newer.issue_id::text, newer.context_snapshot ->> 'issueId') =
+                    coalesce(r.issue_id::text, r.context_snapshot ->> 'issueId')
+                and (newer.created_at, newer.id) > (r.created_at, r.id)
+            )
+          )
+        )
+      returning r.id, r.wakeup_request_id
+    ),
+    cancelled_wakeups as (
+      update agent_wakeup_requests w
+      set status = 'cancelled',
+          error = coalesce(w.error, 'Cancelled stale, duplicate, or no-longer-actionable queued wakeup'),
+          finished_at = coalesce(w.finished_at, now()),
+          updated_at = now()
+      from cancelled_runs r
+      where (w.id = r.wakeup_request_id or w.run_id = r.id)
+        and w.status in ('queued', 'claimed', 'deferred_issue_execution')
+      returning w.id
+    )
+    select id from cancelled_runs
+  `);
+  const cancelledStaleRuns = staleQueueRes.rows ?? staleQueueRes;
+
+  await db.execute(sql`
+    update routine_triggers t
+    set cron_expression = case t.routine_id::text
+          when 'bb3dab66-a107-4f1f-9f7b-7b305f25e3e2' then '0 4 * * 1,3,5'
+          when '3bd6a48e-f2ae-4084-9eb0-15cf864e35e6' then '0 7 1,15 * *'
+          when 'a676e35a-a726-4667-8c06-4bb874c8f5e2' then '0 8 * * 1'
+          else t.cron_expression
+        end,
+        enabled = case
+          when t.routine_id::text = 'a676e35a-a726-4667-8c06-4bb874c8f5e2' then true
+          else t.enabled
+        end,
+        next_run_at = case
+          when t.routine_id::text = 'a676e35a-a726-4667-8c06-4bb874c8f5e2' then now() + interval '1 day'
+          else t.next_run_at
+        end,
+        updated_at = now()
+    where t.kind = 'schedule'
+      and t.routine_id::text in (
+        'bb3dab66-a107-4f1f-9f7b-7b305f25e3e2',
+        '3bd6a48e-f2ae-4084-9eb0-15cf864e35e6',
+        'a676e35a-a726-4667-8c06-4bb874c8f5e2'
+      )
+  `);
+  const throttledRes = await db.execute(sql`
+    update routine_triggers t
+    set next_run_at = now() + interval '6 hours',
+        last_result = 'deferred_openrouter_backlog',
+        updated_at = now()
+    from routines r
+    where t.routine_id = r.id
+      and t.kind = 'schedule'
+      and t.enabled
+      and not t.archived
+      and r.status = 'active'
+      and t.next_run_at <= now() + interval '15 minutes'
+      and exists (
+        select 1
+        from heartbeat_runs queued
+        where queued.company_id = r.company_id
+          and queued.agent_id = r.assignee_agent_id
+          and queued.status = 'queued'
+        group by queued.company_id, queued.agent_id
+        having count(*) > 2 or min(queued.created_at) < now() - interval '24 hours'
+      )
+    returning t.id, r.id as routine_id
+  `);
+  const deletedRes = await db.execute(sql`
+    delete from routines
+    where id::text in (
+      ${OBSOLETE_ROUTINE_IDS[0]}, ${OBSOLETE_ROUTINE_IDS[1]},
+      ${OBSOLETE_ROUTINE_IDS[2]}, ${OBSOLETE_ROUTINE_IDS[3]},
+      ${OBSOLETE_ROUTINE_IDS[4]}
+    )
+    returning id, company_id, title
+  `);
+  const deletedRoutines = deletedRes.rows ?? deletedRes;
   if (Array.isArray(targets)) {
     for (const routine of targets) {
       logger?.info?.({
@@ -578,7 +934,9 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
         routineId: routine.id,
         title: routine.title,
         reason: routine.reason,
-      }, "Paused obsolete or unassignable routine");
+      }, routine.reason === "obsolete_model_automation"
+        ? "Deleted obsolete model automation routine"
+        : "Paused retired or unassignable routine");
     }
   }
   if (Array.isArray(issues)) {
@@ -594,11 +952,15 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
     }
   }
   const policyRows = policyRes.rows ?? policyRes;
+  const throttledRows = throttledRes.rows ?? throttledRes;
   return {
     detachedRunsRecovered: Array.isArray(detachedRuns) ? detachedRuns.length : 0,
     policiesHealed: Array.isArray(policyRows) ? policyRows.length : 0,
-    routinesPaused: routineIds.length,
-    issuesCancelled: Array.isArray(issues) ? issues.length : 0,
+    routinesPaused: routineIds.filter(id => !OBSOLETE_ROUTINE_IDS.includes(id)).length,
+    issuesCancelled: (Array.isArray(issues) ? issues.length : 0),
+    staleRunsCancelled: Array.isArray(cancelledStaleRuns) ? cancelledStaleRuns.length : 0,
+    routinesDeleted: Array.isArray(deletedRoutines) ? deletedRoutines.length : 0,
+    routinesDeferred: Array.isArray(throttledRows) ? throttledRows.length : 0,
   };
 }
 
@@ -615,6 +977,9 @@ export async function reconcileOpenRouterControlPlaneSafely(db, sql, logger) {
       policiesHealed: 0,
       routinesPaused: 0,
       issuesCancelled: 0,
+      staleRunsCancelled: 0,
+      routinesDeleted: 0,
+      routinesDeferred: 0,
     };
   }
 }
@@ -1092,6 +1457,23 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
       output.routines = imported("reconcileOpenRouterControlPlaneSafely") + output.routines;
     }
   }
+  if (typeof output.agentsRoutes === "string") {
+    output.agentsRoutes = replaceOnce(output.agentsRoutes,
+      '    router.get("/companies/:companyId/provider-traces", async (req, res) => {',
+      `    router.get("/companies/:companyId/openrouter-queue", async (req, res) => {
+        const companyId = req.params.companyId;
+        assertCompanyAccess(req, companyId);
+        if (!(await assertRunTelemetryReadAllowed(req, res, companyId)))
+            return;
+        res.set("Cache-Control", "no-cache, no-store");
+        res.json(await listOpenRouterQueue(db, companyId, sql));
+    });
+    router.get("/companies/:companyId/provider-traces", async (req, res) => {`);
+    const agentsRoutesImports = imported("listOpenRouterQueue");
+    if (!output.agentsRoutes.includes(agentsRoutesImports)) {
+      output.agentsRoutes = agentsRoutesImports + output.agentsRoutes;
+    }
+  }
   output.recovery = replaceOnce(output.recovery,
     '            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);',
     `            let latestRun = await getLatestIssueRun(issue.companyId, issue.id);
@@ -1409,6 +1791,7 @@ export function enforceOpenRouterRecovery(root = fileURLToPath(new URL("..", imp
     lifecycle: join(base, "server", "dist", "modules", "agent-lifecycle", "adapters", "postgres.js"),
     runControl: join(base, "server", "dist", "services", "heartbeat", "run-control.js"),
     routines: join(base, "server", "dist", "services", "routines.js"),
+    agentsRoutes: join(base, "server", "dist", "routes", "agents.js"),
   };
   const sources = Object.fromEntries(Object.entries(files).map(([name, path]) => [name, readFileSync(path, "utf8")]));
   const patched = patchOpenRouterSources(sources);

@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { createServer, request } from "node:http";
 import { once } from "node:events";
 import { attachUpgradeProxy } from "./proxy-upgrade.mjs";
-import { enforceAgentRetryPolicy, enforceGeminiAcpModelCompatibility, watchPaperclipReadiness } from "./start.mjs";
+import { enforceAgentRetryPolicy, enforceGeminiAcpModelCompatibility, injectOpenRouterQueueUi, watchPaperclipReadiness } from "./start.mjs";
 import { patchBundledZod } from "./patch-bundled-zod.mjs";
 
 const recovery = `export function classifyAdapterFailureForRecovery(latestRun) {
@@ -34,6 +34,12 @@ export function classifyContinuationFailure(latestRun) {
                             Math.pow(2, Math.max(0, consecutive - 1));
     const retryAt = readProviderQuotaRetryAt(input.latestRun, now);
 }`;
+
+test("injects queue UI into Paperclip HTML exactly once", () => {
+  const html = injectOpenRouterQueueUi(injectOpenRouterQueueUi("<html><body><main>Paperclip</main></body></html>"));
+  assert.match(html, /openrouter-queue-ui\.js/);
+  assert.equal(html.split("/openrouter-queue-ui.js").length - 1, 1);
+});
 
 const gemini = `if (requestedModel && acpxAgent === "gemini") {
         env.GEMINI_MODEL = requestedModel;

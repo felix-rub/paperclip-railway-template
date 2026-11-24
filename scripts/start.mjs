@@ -712,6 +712,12 @@ function resetSetup() {
   console.log("\n🔄 Setup reset. Config and invite file deleted.\n");
 }
 
+export function injectOpenRouterQueueUi(body) {
+  const injection = '<script src="/openrouter-queue-ui.js" defer></script>';
+  if (body.includes("/openrouter-queue-ui.js")) return body;
+  return body.includes("</body>") ? body.replace("</body>", `${injection}</body>`) : `${body}${injection}`;
+}
+
 // ── Proxy ─────────────────────────────────────────────────────────────────────
 
 function proxy(req, res) {
@@ -734,6 +740,7 @@ function proxy(req, res) {
     method: req.method,
     headers: {
       ...req.headers,
+      "accept-encoding": "identity",
       "x-forwarded-host": req.headers.host,
       "x-forwarded-proto": "https",
       "x-forwarded-for": req.socket.remoteAddress,
@@ -741,6 +748,21 @@ function proxy(req, res) {
   };
 
   const upstream = httpRequest(opts, (upRes) => {
+    const contentType = String(upRes.headers["content-type"] || "");
+    if (upRes.statusCode === 200 && contentType.includes("text/html")) {
+      const headers = { ...upRes.headers };
+      delete headers["content-length"];
+      delete headers["content-encoding"];
+      delete headers.etag;
+      res.writeHead(upRes.statusCode, headers);
+      const chunks = [];
+      upRes.on("data", chunk => chunks.push(chunk));
+      upRes.on("end", () => {
+        const body = Buffer.concat(chunks).toString("utf8");
+        res.end(injectOpenRouterQueueUi(body));
+      });
+      return;
+    }
     res.writeHead(upRes.statusCode, upRes.headers);
     upRes.pipe(res, { end: true });
   });
@@ -784,6 +806,14 @@ function startServer() {
     const ready = isReady();
 
     // ── Setup API routes (always available) ──────────────────────────────────
+    if (path === "/openrouter-queue-ui.js" && method === "GET") {
+      res.writeHead(200, {
+        "Content-Type": "application/javascript; charset=utf-8",
+        "Cache-Control": "no-cache",
+      });
+      res.end(readFileSync(join(__dirname, "openrouter-queue-ui.js"), "utf8"));
+      return;
+    }
 
     if (path === "/setup/status" && method === "GET") {
       res.writeHead(200, { "Content-Type": "application/json" });

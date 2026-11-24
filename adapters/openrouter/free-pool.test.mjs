@@ -147,6 +147,33 @@ test("short per-minute cooldowns are waited out instead of failing the run", asy
   }
 });
 
+test("concurrent requests spread across distinct ready provider lanes", async () => {
+  const started = [];
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const { fetchImpl } = fakeUpstream({ handlers: async (url, body) => {
+    started.push(url === GEMINI ? body.model : "openrouter/free");
+    if (started.length === 3) release();
+    await gate;
+    return sse([{ choices: [{ index: 0, delta: { content: "ok" }, finish_reason: "stop" }] }]);
+  } });
+  const pool = createFreePool({
+    env: { GEMINI_API_KEY: "g-key", FREE_POOL_GEMINI_MODELS: "m1,m2" },
+    fetchImpl,
+    log: () => {},
+  });
+  await pool.start();
+  try {
+    const results = await Promise.all(Array.from({ length: 3 }, (_, index) =>
+      post(pool, pool.issueToken({ openrouterKey: "or-key", runId: `run-${index}` }), request())));
+    assert.ok(results.every(result => result.status === 200));
+    assert.equal(new Set(results.map(result => result.lane)).size, 3);
+    assert.deepEqual(new Set(started), new Set(["m1", "m2", "openrouter/free"]));
+  } finally {
+    await pool.close();
+  }
+});
+
 test("classifies failures and sanitizes Gemini payloads", () => {
   const now = Date.parse("2026-05-01T10:00:00Z");
   const gemini = { provider: "gemini" };
@@ -154,6 +181,7 @@ test("classifies failures and sanitizes Gemini payloads", () => {
   assert.equal(classifyFailure(gemini, 429, JSON.stringify({ error: { message: "quota" } }), null, now).disableGemini, true);
   assert.equal(classifyFailure(gemini, 503, "{}", null, now).reason, "overloaded");
   assert.equal(classifyFailure(gemini, 400, JSON.stringify({ error: { message: "bad schema" } }), null, now).failover, false);
+  assert.equal(classifyFailure(gemini, 400, "function_call_filter: MALFORMED_FUNCTION_CALL", null, now).reason, "malformed_tool_call");
   assert.equal(classifyFailure({ provider: "openrouter" }, 429, '{"error":{"message":"free-models-per-day"}}',
     new Headers(), now).cooldownUntil, now + 60 * 60 * 1000);
   const out = toGeminiRequest({
