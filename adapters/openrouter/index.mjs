@@ -50,7 +50,8 @@ OpenCode, Codex and Claude Code are not used by this adapter.
 Use the environment editor for secrets; this external adapter does not impersonate
 a built-in adapter to bypass managed AI-connection compatibility checks.
 Do not bind a managed AI account to this adapter; use OPENROUTER_API_KEY instead.
-Other adapter types and their agents are unchanged.
+The Railway wrapper enforces this adapter and saved model openrouter/free for
+existing active-company agents, new hires and imports across all companies.
 `;
 
 function errorText(error) {

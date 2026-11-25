@@ -3,6 +3,82 @@ import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 
 export const OPENROUTER_RETRY_MS = 60 * 60 * 1000;
+const FREE_AGENT_CONFIG_REMOVED_KEYS = [
+  "provider", "acpxAgent", "fallbackModels", "escalationModel", "apiKey",
+  "baseUrl", "command", "args", "extraArgs", "aiConnection",
+];
+
+export function normalizeFreeAgentConfiguration(input, existing = {}) {
+  const adapterConfig = { ...(input.adapterConfig ?? existing.adapterConfig ?? {}) };
+  for (const key of FREE_AGENT_CONFIG_REMOVED_KEYS) delete adapterConfig[key];
+  adapterConfig.model = "openrouter/free";
+  const runtimeConfig = { ...(input.runtimeConfig ?? existing.runtimeConfig ?? {}) };
+  delete runtimeConfig.aiConnection;
+  return { ...input, adapterType: "openrouter", adapterConfig, runtimeConfig };
+}
+
+const freeAgentPolicyInstalled = new WeakSet();
+
+export async function enforceFreeAgentDefaults(db, sql, logger) {
+  if (freeAgentPolicyInstalled.has(db)) return;
+  // The trigger also covers portability imports and writes outside the hiring API.
+  await db.execute(sql.raw(`
+    create or replace function paperclip_free_agent_config(config jsonb) returns jsonb
+    language sql immutable as $policy$
+      select (coalesce(config, '{}'::jsonb) - array[${FREE_AGENT_CONFIG_REMOVED_KEYS.map(key => `'${key}'`).join(",")}]::text[])
+        || '{"model":"openrouter/free"}'::jsonb
+    $policy$;
+  `));
+  await db.execute(sql.raw(`
+    create or replace function paperclip_enforce_free_agent() returns trigger
+    language plpgsql as $policy$
+    begin
+      new.adapter_type := 'openrouter';
+      new.adapter_config := paperclip_free_agent_config(new.adapter_config);
+      new.runtime_config := coalesce(new.runtime_config, '{}'::jsonb) - 'aiConnection';
+      return new;
+    end
+    $policy$;
+  `));
+  await db.execute(sql.raw(`
+    create or replace trigger paperclip_free_agent_defaults
+    before insert or update of adapter_type, adapter_config, runtime_config on agents
+    for each row execute function paperclip_enforce_free_agent();
+  `));
+  const repaired = await db.execute(sql`
+    update agents a
+    set adapter_type = 'openrouter',
+        adapter_config = paperclip_free_agent_config(a.adapter_config),
+        runtime_config = coalesce(a.runtime_config, '{}'::jsonb) - 'aiConnection',
+        updated_at = now()
+    from companies c
+    where c.id = a.company_id and c.status <> 'archived' and a.status <> 'terminated'
+      and (a.adapter_type <> 'openrouter'
+        or a.adapter_config is distinct from paperclip_free_agent_config(a.adapter_config)
+        or a.runtime_config ? 'aiConnection')
+    returning a.id, a.company_id
+  `);
+  const inventory = await db.execute(sql`
+    select c.id as company_id, c.name as company_name, count(*)::int as agents,
+      count(*) filter (where a.adapter_type = 'openrouter'
+        and a.adapter_config->>'model' = 'openrouter/free'
+        and not (a.runtime_config ? 'aiConnection'))::int as free_agents
+    from companies c join agents a on a.company_id = c.id
+    where c.status <> 'archived' and a.status <> 'terminated'
+    group by c.id, c.name order by c.name
+  `);
+  const rows = inventory.rows ?? inventory;
+  if (!Array.isArray(rows) || rows.some(row => row.agents !== row.free_agents)) {
+    throw new Error("Free agent defaults verification failed");
+  }
+  logger?.info?.({
+    tag: "openrouter.agent_defaults",
+    repairedAgents: (repaired.rows ?? repaired).length,
+    companies: rows,
+  }, "Verified persisted free-only agent defaults across organizations");
+  freeAgentPolicyInstalled.add(db);
+}
+
 export const DEFAULT_OPENROUTER_MAX_CONCURRENT_RUNS = 4;
 const OPENROUTER_QUOTA_THROTTLE_FAILURES = 3;
 const DEFAULT_SWEEP_BATCH_LIMIT = 25;
@@ -502,6 +578,7 @@ const stateLogTimestamps = new WeakMap();
 const STATE_LOG_INTERVAL_MS = 5 * 60_000;
 
 export async function reconcileOpenRouterControlPlane(db, sql, logger) {
+  await enforceFreeAgentDefaults(db, sql, logger);
   const detachedRes = await db.execute(sql`
     with stale_detached as (
       update heartbeat_runs r
@@ -1381,6 +1458,35 @@ function replaceOnce(source, before, after) {
 export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
   const output = { ...sources };
   const imported = names => `import { ${names} } from ${JSON.stringify(moduleUrl)};\n`;
+  for (const [name, anchor, replacement] of [
+    ["runnerSelection",
+      "export async function resolveNewAgentRunnerForCompany(db, companyId, input) {",
+      `export async function resolveNewAgentRunnerForCompany(db, companyId, input) {
+    return normalizeFreeAgentConfiguration(input);
+}
+async function upstreamResolveNewAgentRunnerForCompany(db, companyId, input) {`],
+    ["agentHiring",
+      "export async function prepareAgentHire(db, companyId, input, options) {",
+      "export async function prepareAgentHire(db, companyId, input, options) {\n    input = normalizeFreeAgentConfiguration(input);"],
+    ["agentConfiguration",
+      "export async function prepareAgentConfiguration(db, existing, data, options) {",
+      "export async function prepareAgentConfiguration(db, existing, data, options) {\n    data = normalizeFreeAgentConfiguration(data, existing);"],
+  ]) {
+    if (output[name] === undefined) continue;
+    output[name] = replaceOnce(output[name], anchor, replacement);
+    if (!output[name].includes(imported("normalizeFreeAgentConfiguration"))) {
+      output[name] = imported("normalizeFreeAgentConfiguration") + output[name];
+    }
+  }
+  if (output.agentsRoutes !== undefined) {
+    output.agentsRoutes = replaceOnce(output.agentsRoutes,
+      "        const normalized = normalizeNewAgentRuntimeConfig(runtimeConfig);",
+      `        const normalized = normalizeNewAgentRuntimeConfig(runtimeConfig);
+        if (adapterType === "openrouter") {
+            delete normalized.aiConnection;
+            return normalized;
+        }`);
+  }
   output.retries = replaceOnce(output.retries,
     '    async function scheduleBoundedRetryForRun(run, agent, opts) {',
     `    async function scheduleBoundedRetryForRun(run, agent, opts) {
@@ -1792,6 +1898,9 @@ export function enforceOpenRouterRecovery(root = fileURLToPath(new URL("..", imp
     runControl: join(base, "server", "dist", "services", "heartbeat", "run-control.js"),
     routines: join(base, "server", "dist", "services", "routines.js"),
     agentsRoutes: join(base, "server", "dist", "routes", "agents.js"),
+    runnerSelection: join(base, "server", "dist", "services", "agent-runner-selection.js"),
+    agentHiring: join(base, "server", "dist", "services", "agent-hiring.js"),
+    agentConfiguration: join(base, "server", "dist", "services", "agent-configuration.js"),
   };
   const sources = Object.fromEntries(Object.entries(files).map(([name, path]) => [name, readFileSync(path, "utf8")]));
   const patched = patchOpenRouterSources(sources);

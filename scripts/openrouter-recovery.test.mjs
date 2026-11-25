@@ -4,6 +4,8 @@ import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import {
   limitOpenRouterAvailableSlots,
+  enforceFreeAgentDefaults,
+  normalizeFreeAgentConfiguration,
   listOpenRouterQueue,
   OBSOLETE_ROUTINE_IDS,
   openRouterLocalTerminationProof,
@@ -19,6 +21,98 @@ import {
   withOpenRouterClaimLock,
   OPENROUTER_RETRY_MS,
 } from "./openrouter-recovery.mjs";
+
+test("free agent defaults replace paid routing without losing instructions or heartbeat settings", () => {
+  const input = {
+    name: "Fefe worker", adapterType: "paperclip_runner",
+    adapterConfig: {
+      model: "openai/gpt-4o", provider: "openai", fallbackModels: "gpt-4o",
+      escalationModel: "gpt-5", command: "codex", apiKey: "old-key",
+      instructionsFilePath: "/work/AGENTS.md", cwd: "/work", timeoutSec: 240,
+      env: { OPENROUTER_API_KEY: { type: "secret_ref", secretId: "company-secret" } },
+    },
+    runtimeConfig: { aiConnection: { mode: "router", connectionId: "paid-pool" }, heartbeat: { intervalSec: 3600 } },
+  };
+  const normalized = normalizeFreeAgentConfiguration(input);
+  assert.deepEqual(normalized, {
+    name: input.name, adapterType: "openrouter",
+    adapterConfig: {
+      model: "openrouter/free", instructionsFilePath: "/work/AGENTS.md", cwd: "/work",
+      timeoutSec: 240, env: input.adapterConfig.env,
+    },
+    runtimeConfig: { heartbeat: { intervalSec: 3600 } },
+  });
+  assert.equal(input.adapterConfig.model, "openai/gpt-4o");
+  assert.deepEqual(normalizeFreeAgentConfiguration(normalized), normalized);
+  assert.deepEqual(normalizeFreeAgentConfiguration({}), {
+    adapterType: "openrouter", adapterConfig: { model: "openrouter/free" }, runtimeConfig: {},
+  });
+  assert.deepEqual(normalizeFreeAgentConfiguration({ name: "renamed" }, normalized),
+    { ...normalized, name: "renamed" });
+});
+
+test("database policy repairs both orgs and enforces future inserts/imports/updates", {
+  skip: !process.env.FREE_AGENT_TEST_DATABASE_URL,
+}, async () => {
+  const url = new URL(process.env.FREE_AGENT_TEST_DATABASE_URL);
+  assert.ok(["localhost", "127.0.0.1"].includes(url.hostname));
+  assert.equal(url.pathname, "/free_agent_defaults_test");
+  const { createDb, closeRegisteredClients } = await import("@paperclipai/db");
+  const { sql } = await import("drizzle-orm");
+  const db = createDb(url.href);
+  try {
+    await db.transaction(async tx => {
+      await tx.execute(sql.raw(`
+        create temporary table companies (id text primary key, name text, status text);
+        create temporary table agents (
+          id text primary key, company_id text references companies(id),
+          status text default 'idle', adapter_type text default 'process',
+          adapter_config jsonb default '{}', runtime_config jsonb default '{}',
+          updated_at timestamptz default now()
+        );
+        insert into companies values ('fe','FE','active'), ('fefe','Fefe GmbH','active'), ('archive','Old','archived');
+        insert into agents (id,company_id,adapter_type,adapter_config,runtime_config) values
+          ('fe-agent','fe','openrouter','{"model":"openrouter/free","cwd":"/work"}','{"heartbeat":{"intervalSec":3600}}'),
+          ('fefe-agent','fefe','paperclip_runner','{"model":"gpt-4o","provider":"openai","instructionsFilePath":"/work/AGENTS.md"}','{"aiConnection":{"mode":"router"}}'),
+          ('archived-agent','archive','process','{}','{}');
+      `));
+      const logs = [];
+      await enforceFreeAgentDefaults(tx, sql, { info: payload => logs.push(payload) });
+      assert.equal(logs[0].repairedAgents, 1);
+      assert.deepEqual(logs[0].companies.map(c => [c.company_name, c.agents, c.free_agents]),
+        [["FE", 1, 1], ["Fefe GmbH", 1, 1]]);
+      const result = await tx.execute(sql`select * from agents order by id`);
+      const rows = result.rows ?? result;
+      assert.equal(rows.find(r => r.id === "archived-agent").adapter_type, "process");
+      assert.deepEqual(rows.find(r => r.id === "fefe-agent").adapter_config,
+        { model: "openrouter/free", instructionsFilePath: "/work/AGENTS.md" });
+      assert.deepEqual(rows.find(r => r.id === "fe-agent").runtime_config,
+        { heartbeat: { intervalSec: 3600 } });
+      await tx.execute(sql.raw(`
+        insert into companies values ('future','Future org','active');
+        insert into agents (id,company_id) values ('new-default','future');
+        insert into agents (id,company_id,adapter_type,adapter_config,runtime_config)
+          values ('imported','future','codex_local','{"model":"gpt-4o","fallbackModels":"gpt-5","cwd":"/new"}','{"aiConnection":{"mode":"router"},"heartbeat":{"intervalSec":120}}');
+        update agents set adapter_type='paperclip_runner', adapter_config='{"model":"gpt-4o","provider":"openai"}' where id='new-default';
+      `));
+      const futureResult = await tx.execute(sql`select * from agents where company_id = 'future'`);
+      const future = futureResult.rows ?? futureResult;
+      assert.equal(future.length, 2);
+      for (const agent of future) {
+        assert.equal(agent.adapter_type, "openrouter");
+        assert.equal(agent.adapter_config.model, "openrouter/free");
+        assert.equal(agent.adapter_config.provider, undefined);
+        assert.equal(agent.adapter_config.fallbackModels, undefined);
+        assert.equal(agent.runtime_config.aiConnection, undefined);
+      }
+      assert.equal(future.find(a => a.id === "imported").adapter_config.cwd, "/new");
+      await enforceFreeAgentDefaults(tx, sql, { info() { assert.fail("policy must install once"); } });
+      await tx.execute(sql.raw("drop function paperclip_enforce_free_agent() cascade; drop function paperclip_free_agent_config(jsonb);"));
+    });
+  } finally {
+    await closeRegisteredClients(url.href);
+  }
+});
 
 test("committed budget Stops settle for finished local openrouter runs only", () => {
   const agent = { adapterType: "openrouter" };
@@ -63,9 +157,16 @@ test("patch matches installed upstream, installs every hook, and remains idempot
     runControl: readFileSync(new URL(`${server}heartbeat/run-control.js`, import.meta.url), "utf8"),
     routines: readFileSync(new URL(`${server}routines.js`, import.meta.url), "utf8"),
     agentsRoutes: readFileSync(new URL(`${server}../routes/agents.js`, import.meta.url), "utf8"),
+    runnerSelection: readFileSync(new URL(`${server}agent-runner-selection.js`, import.meta.url), "utf8"),
+    agentHiring: readFileSync(new URL(`${server}agent-hiring.js`, import.meta.url), "utf8"),
+    agentConfiguration: readFileSync(new URL(`${server}agent-configuration.js`, import.meta.url), "utf8"),
   };
   const patched = patchOpenRouterSources(sources);
   assert.deepEqual(patchOpenRouterSources(patched), patched);
+  for (const name of ["runnerSelection", "agentHiring", "agentConfiguration"]) {
+    assert.match(patched[name], /normalizeFreeAgentConfiguration/);
+    execFileSync(process.execPath, ["--check", "--input-type=module"], { input: patched[name] });
+  }
   assert.match(patched.runControl, /return openRouterLocalTerminationProof\(/);
   assert.match(patched.runControl, /async function upstreamCompletedRunTerminationProof\(run\)/);
   assert.match(patched.retries, /opts = openRouterRetryOptions/);
@@ -102,6 +203,7 @@ test("patch matches installed upstream, installs every hook, and remains idempot
 test("control-plane cleanup uses SQL predicates instead of Drizzle UUID array interpolation", async () => {
   const queries = [];
   const sqlTag = (strings, ...values) => ({ text: strings.join("?"), values });
+  sqlTag.raw = text => ({ text, values: [] });
   const fakeDb = {
     async execute(query) {
       queries.push(query);
@@ -306,11 +408,15 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
   let notifiedQueue = 0;
   const infoLogs = [];
   const sqlTag = (strings, ...values) => ({ text: strings.join("?"), values });
+  sqlTag.raw = text => ({ text, values: [] });
   const fakeDb = {
     async transaction(fn) {
       return fn({ isTransaction: true });
     },
     async execute(query) {
+      if (query.text.includes("create or replace")) return { rows: [] };
+      if (query.text.includes("paperclip_free_agent_config(a.adapter_config)")) return { rows: [] };
+      if (query.text.includes("as free_agents")) return { rows: [] };
       if (query.text.includes("with stale_detached as")) return { rows: [] };
       if (query.text.includes("update budget_policies p")) return { rows: [] };
       if (query.text.includes("insert into budget_policies")) return { rows: [] };
@@ -368,7 +474,7 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
   assert.deepEqual(reconciledAgents, ["agent-paused-1"]);
   assert.deepEqual(scheduledLifecycles, ["agent-verifying-1", "agent-verifying-2"]);
   assert.equal(notifiedQueue, 1);
-  assert.equal(infoLogs[0].payload.tag, "openrouter.reconcile.state");
+  assert.ok(infoLogs.some(log => log.payload.tag === "openrouter.reconcile.state"));
 
   const second = await reconcileOpenRouterRetries(fakeDb, deps, sqlTag, logger);
   assert.equal(second.unparkedAgents, 0, "Boot retryAt force-unpark runs once per DB process");

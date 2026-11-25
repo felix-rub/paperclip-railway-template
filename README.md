@@ -79,6 +79,16 @@ hours. Similar future routines are not deleted by a broad name match.
 
 ### Permanent hourly recovery
 
+This Railway instance enforces `openrouter` with saved model `openrouter/free`
+for new hires and configuration changes, independent of company. On startup,
+existing non-terminated agents in non-archived companies are repaired too.
+Provider/paid fallback overrides and managed AI-connection bindings are removed;
+instructions, workspace, heartbeat settings and secret references are preserved.
+A database trigger applies the same policy to imports and future companies,
+so stale GPT-4o defaults cannot be persisted. Archived agents are not bulk migrated.
+Free-provider quota limits still apply; a correct saved model does not guarantee
+immediate provider availability.
+
 Every failed, timed-out or interrupted OpenRouter run gets a database-backed
 `scheduled_retry`, due one hour after its persisted failure timestamp. There is
 no finite attempt budget or exponential backoff. Free quota exhaustion, router
