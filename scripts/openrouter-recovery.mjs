@@ -1462,7 +1462,8 @@ export function patchOpenRouterSources(sources, moduleUrl = import.meta.url) {
     ["runnerSelection",
       "export async function resolveNewAgentRunnerForCompany(db, companyId, input) {",
       `export async function resolveNewAgentRunnerForCompany(db, companyId, input) {
-    return normalizeFreeAgentConfiguration(input);
+    const { adapterType, adapterConfig } = normalizeFreeAgentConfiguration(input);
+    return { adapterType, adapterConfig };
 }
 async function upstreamResolveNewAgentRunnerForCompany(db, companyId, input) {`],
     ["agentHiring",

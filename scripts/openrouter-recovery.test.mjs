@@ -141,7 +141,7 @@ test("OpenRouter retries use the persisted failure clock, never exponential back
   assert.throws(() => openRouterRetryOptions({ finishedAt: "invalid" }, agent), /timestamp/);
 });
 
-test("patch matches installed upstream, installs every hook, and remains idempotent", () => {
+test("patch matches installed upstream, installs every hook, and remains idempotent", async () => {
   const server = "../node_modules/@paperclipai/server/dist/services/";
   const sources = {
     retries: readFileSync(new URL(`${server}heartbeat/retries.js`, import.meta.url), "utf8"),
@@ -167,6 +167,15 @@ test("patch matches installed upstream, installs every hook, and remains idempot
     assert.match(patched[name], /normalizeFreeAgentConfiguration/);
     execFileSync(process.execPath, ["--check", "--input-type=module"], { input: patched[name] });
   }
+  const resolverBody = patched.runnerSelection.match(/export async function resolveNewAgentRunnerForCompany\(db, companyId, input\) \{([\s\S]*?)\n\}/)[1];
+  const resolveRunner = new Function("normalizeFreeAgentConfiguration",
+    `return async function(db, companyId, input) {${resolverBody}}`)(normalizeFreeAgentConfiguration);
+  assert.deepEqual(await resolveRunner(null, "future-org", {
+    adapterType: "codex_local", adapterConfig: { model: "gpt-4o", cwd: "/work" },
+    runner: "auto", setupOnly: true, onConfigurationWarnings() {},
+  }), {
+    adapterType: "openrouter", adapterConfig: { model: "openrouter/free", cwd: "/work" },
+  });
   assert.match(patched.runControl, /return openRouterLocalTerminationProof\(/);
   assert.match(patched.runControl, /async function upstreamCompletedRunTerminationProof\(run\)/);
   assert.match(patched.retries, /opts = openRouterRetryOptions/);
