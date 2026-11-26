@@ -39,10 +39,11 @@ class CompletionError extends Error {
   }
 }
 
-async function readVerifiedCompletion(response) {
+async function readVerifiedCompletion(response, onChunk = () => {}) {
   const chunks = [];
   let bytes = 0;
   for await (const chunk of response.body) {
+    onChunk();
     bytes += chunk.byteLength;
     if (bytes > MAX_COMPLETION_BYTES) throw new CompletionError(502, "Provider completion exceeded the 8 MiB limit");
     chunks.push(Buffer.from(chunk));
@@ -389,8 +390,14 @@ export function createFreePool({
         lane.busy = true;
         const started = now();
         const headerTimer = new AbortController();
-        const timer = setTimeout(() => headerTimer.abort(), headerTimeoutMs);
+        let timer = setTimeout(() => headerTimer.abort(), headerTimeoutMs);
         timer.unref?.();
+        // Idle timeout: each received chunk re-arms it, so slow but live streams survive.
+        const touch = () => {
+          clearTimeout(timer);
+          timer = setTimeout(() => headerTimer.abort(), headerTimeoutMs);
+          timer.unref?.();
+        };
         try {
           const upstream = upstreamRequest(lane, body, grant, req.headers);
           const response = await fetchImpl(upstream.url, {
@@ -415,7 +422,8 @@ export function createFreePool({
           }
           // Buffer one completion, not the whole agent run: never expose partial tool
           // calls before knowing whether replay on another lane is necessary.
-          const completion = await readVerifiedCompletion(response);
+          touch();
+          const completion = await readVerifiedCompletion(response, touch);
           if (clientAbort.signal.aborted) return res.end();
           lane.ok += 1;
           grant.lane = lane.id;

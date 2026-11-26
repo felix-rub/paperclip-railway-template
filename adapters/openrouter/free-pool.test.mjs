@@ -310,6 +310,32 @@ test("stalled response bodies time out and release the lane for failover", { tim
   } finally { await pool.close(); }
 });
 
+test("slow but live completion streams outlast the idle timeout", { timeout: 5000 }, async () => {
+  const encoder = new TextEncoder();
+  const fetchImpl = async (url, init) => {
+    const events = [...Array(6)].map(() => `data: ${JSON.stringify({ choices: [{ delta: { content: "x" } }] })}\n\n`)
+      .concat(`data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}\n\ndata: [DONE]\n\n`);
+    return new Response(new ReadableStream({
+      async start(controller) {
+        init.signal.addEventListener("abort", () => controller.error(new Error("aborted")), { once: true });
+        for (const event of events) {
+          await new Promise(r => setTimeout(r, 30));
+          if (init.signal.aborted) return;
+          controller.enqueue(encoder.encode(event));
+        }
+        controller.close();
+      },
+    }), { headers: { "content-type": "text/event-stream" } });
+  };
+  const pool = createFreePool({ env: { FREE_POOL_HEADER_TIMEOUT_MS: "80", FREE_POOL_MAX_WAIT_MS: "0" }, fetchImpl, log: () => {} });
+  await pool.start();
+  try {
+    const result = await post(pool, pool.issueToken({ openrouterKey: "or-key" }), request());
+    assert.equal(result.status, 200);
+    assert.equal(result.lane, "openrouter/free");
+  } finally { await pool.close(); }
+});
+
 test("classifies failures and sanitizes Gemini payloads", () => {
   const now = Date.parse("2026-05-01T10:00:00Z");
   const gemini = { provider: "gemini" };

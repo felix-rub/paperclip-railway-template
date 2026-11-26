@@ -5,6 +5,7 @@ import { test } from "node:test";
 import {
   limitOpenRouterAvailableSlots,
   enforceFreeAgentDefaults,
+  pullForwardIdleOpenRouterRetries,
   normalizeFreeAgentConfiguration,
   listOpenRouterQueue,
   OBSOLETE_ROUTINE_IDS,
@@ -124,6 +125,51 @@ test("database policy repairs both orgs and enforces future inserts/imports/upda
       await tx.execute(sql.raw("drop function paperclip_enforce_free_agent() cascade; drop function paperclip_free_agent_config(jsonb); drop function paperclip_free_agent_runtime(jsonb);"));
     });
   } finally {
+    await closeRegisteredClients(url.href);
+  }
+});
+
+test("idle companies get one aged OpenRouter retry pulled forward; busy companies and exhausted pools wait", {
+  skip: !process.env.FREE_AGENT_TEST_DATABASE_URL,
+}, async () => {
+  const url = new URL(process.env.FREE_AGENT_TEST_DATABASE_URL);
+  assert.ok(["localhost", "127.0.0.1"].includes(url.hostname));
+  const { createDb, closeRegisteredClients } = await import("@paperclipai/db");
+  const { sql } = await import("drizzle-orm");
+  const db = createDb(url.href);
+  const key = Symbol.for("paperclip.freePool");
+  const previousPool = globalThis[key];
+  try {
+    await db.transaction(async tx => {
+      await tx.execute(sql.raw(`
+        create temporary table agents (id text primary key, company_id text, adapter_type text);
+        create temporary table heartbeat_runs (
+          id text primary key, company_id text, agent_id text, status text, retry_of_run_id text,
+          scheduled_retry_at timestamptz, finished_at timestamptz, context_snapshot jsonb,
+          updated_at timestamptz default now()
+        );
+        insert into agents values ('a1','idle','openrouter'), ('a2','idle','openrouter'), ('b1','busy','openrouter');
+        insert into heartbeat_runs (id,company_id,agent_id,status,retry_of_run_id,scheduled_retry_at,finished_at) values
+          ('p-old','idle','a1','failed',null,null,now() - interval '40 minutes'),
+          ('w-old','idle','a1','scheduled_retry','p-old',now() + interval '20 minutes',null),
+          ('p-new','idle','a2','failed',null,null,now() - interval '20 minutes'),
+          ('w-new','idle','a2','scheduled_retry','p-new',now() + interval '40 minutes',null),
+          ('p-fresh','busy','b1','failed',null,null,now() - interval '30 minutes'),
+          ('w-busy','busy','b1','scheduled_retry','p-fresh',now() + interval '30 minutes',null),
+          ('running','busy','b1','running',null,null,null);
+      `));
+      globalThis[key] = { exhaustedUntil: () => Date.now() + 60_000 };
+      assert.equal(await pullForwardIdleOpenRouterRetries(tx, sql), 0);
+      globalThis[key] = { exhaustedUntil: () => 0 };
+      assert.equal(await pullForwardIdleOpenRouterRetries(tx, sql), 1);
+      const result = await tx.execute(sql.raw(
+        "select id, scheduled_retry_at <= now() as due, context_snapshot ? 'pulledForwardAt' as pulled from heartbeat_runs where status = 'scheduled_retry' order by id"));
+      assert.deepEqual((result.rows ?? result).map(r => [r.id, r.due, r.pulled ?? false]),
+        [["w-busy", false, false], ["w-new", false, false], ["w-old", true, true]]);
+      assert.equal(await pullForwardIdleOpenRouterRetries(tx, sql), 0, "a due retry already occupies the idle company");
+    });
+  } finally {
+    globalThis[key] = previousPool;
     await closeRegisteredClients(url.href);
   }
 });

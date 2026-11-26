@@ -1156,6 +1156,44 @@ export async function reconcileOpenRouterAgentReadiness(db, deps, sql, logger) {
   return { healedAgents, resumedAgents, unparkedAgents, isFirstBootSweep };
 }
 
+// Hourly retries leave workers idle once provider quota recovers early. When the
+// free pool is not exhausted, promote one aged retry per idle company (fair and
+// bounded: a failed probe just waits for the next sweep, never thrashes quota).
+export async function pullForwardIdleOpenRouterRetries(db, sql, now = Date.now()) {
+  if (freePoolExhaustedUntil(now)) return 0;
+  const result = await db.execute(sql`
+    with eligible as (
+      select distinct on (waiting.company_id) waiting.id
+      from heartbeat_runs waiting
+      join heartbeat_runs predecessor on predecessor.id = waiting.retry_of_run_id
+        and predecessor.company_id = waiting.company_id
+      join agents a on a.id = waiting.agent_id and a.company_id = waiting.company_id
+      where a.adapter_type = 'openrouter'
+        and waiting.status = 'scheduled_retry'
+        and waiting.scheduled_retry_at > now()
+        and predecessor.finished_at < now() - interval '10 minutes'
+        and not exists (
+          select 1 from heartbeat_runs busy
+          join agents ba on ba.id = busy.agent_id and ba.company_id = busy.company_id
+          where busy.company_id = waiting.company_id and ba.adapter_type = 'openrouter'
+            and (busy.status in ('queued', 'running')
+              or (busy.status = 'scheduled_retry' and busy.scheduled_retry_at <= now()))
+        )
+      order by waiting.company_id, predecessor.finished_at asc, waiting.id
+    )
+    update heartbeat_runs waiting
+    set scheduled_retry_at = now(),
+        context_snapshot = coalesce(waiting.context_snapshot, '{}'::jsonb)
+          || jsonb_build_object('scheduledRetryAt', now(), 'pulledForwardAt', now()),
+        updated_at = now()
+    from eligible
+    where waiting.id = eligible.id and waiting.status = 'scheduled_retry'
+    returning waiting.id
+  `);
+  const rows = result.rows ?? result;
+  return Array.isArray(rows) ? rows.length : 0;
+}
+
 // The ordinary retry service owns locks, authorization, session inheritance and
 // successor deduplication. This sweep only recovers terminal work it missed.
 export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {}) {
@@ -1177,8 +1215,10 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {
       and waiting.status = 'scheduled_retry'
       and predecessor.status in ('failed', 'timed_out', 'interrupted')
       and predecessor.finished_at is not null
+      and waiting.context_snapshot->>'pulledForwardAt' is null
       and waiting.scheduled_retry_at is distinct from predecessor.finished_at + interval '1 hour'
   `);
+  const pulledForward = await pullForwardIdleOpenRouterRetries(db, sql);
   await db.execute(sql`
     with superseded_company_retries as (
       update heartbeat_runs waiting
@@ -1406,7 +1446,7 @@ export async function reconcileOpenRouterRetries(db, deps, sql, logger, opts = {
       logger?.error?.({ err: error }, "OpenRouter readiness summary failed");
     }
   }
-  return { selected: rows.length, scheduled, ...readiness };
+  return { selected: rows.length, scheduled, pulledForward, ...readiness };
 }
 
 const sweepStates = new WeakMap();

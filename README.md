@@ -63,8 +63,9 @@ each exhausted lane until its quota window or for at most one hour.
 - **Completion validation:** each completion is buffered (up to 8 MiB) until a
   valid finish reason arrives. Malformed tool calls, broken streams and embedded
   provider errors fail over before partial output can reach the agent. The
-  `FREE_POOL_HEADER_TIMEOUT_MS` deadline (default 90 seconds) now covers the
-  response body too. Incremental output appears after each verified completion.
+  `FREE_POOL_HEADER_TIMEOUT_MS` deadline (default 90 seconds) is an idle
+  timeout: it covers headers and every gap between body chunks, so slow but
+  live completions are not cut off. Incremental output appears after each verified completion.
 - **Secrets:** Pi receives only a per-run gateway token. The real OpenRouter and
   Gemini keys are not passed to Pi or its tool subprocesses.
 - **Privacy:** Google may use free-tier Gemini prompts to improve its products.
@@ -105,6 +106,9 @@ no finite attempt budget or exponential backoff. Free quota exhaustion, router
 unavailability, configuration errors and compact guard stops all wait for the next
 hour; no paid model is substituted. Pi's immediate provider/agent retries are
 disabled for this adapter.
+When the free pool is not exhausted, each org with no queued, running or due
+OpenRouter work gets its oldest retry (failed at least 10 minutes ago) promoted
+early, one per sweep, so idle workers do not wait out the full hour.
 New-agent verification failures follow the same hourly interval without dropping
 accepted work; readiness is never fabricated while the provider is unavailable.
 
