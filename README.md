@@ -51,7 +51,8 @@ each exhausted lane until its quota window or for at most one hour.
 
 - **Billing guard:** Gemini lanes only run while the key is proven to be free
   tier. The gateway probes a paid-only model and expects a `FreeTier` 429. If the
-  Google project ever gets billing, Gemini lanes switch off automatically.
+  six-hour verification expires, Gemini lanes stop until rechecked. A detected
+  billing change disables them. `FREE_POOL_GEMINI=0` also disables tier probes.
 - **Global gate:** when every lane is cooling down, queued runs stay queued
   instead of burning retries. Dispatch resumes automatically once a lane recovers.
 - **Fair concurrency:** dispatch defaults to four workers, reserves at least one

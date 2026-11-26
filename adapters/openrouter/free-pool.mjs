@@ -237,18 +237,19 @@ export function createFreePool({
   }),
 } = {}) {
   const geminiKey = (env.GEMINI_API_KEY || env.GOOGLE_API_KEY || "").trim();
+  const geminiEnabled = Boolean(geminiKey) && env.FREE_POOL_GEMINI !== "0";
   const geminiModels = parseList(env.FREE_POOL_GEMINI_MODELS, DEFAULT_GEMINI_FREE_MODELS);
   const tierProbeModels = parseList(env.FREE_POOL_GEMINI_TIER_PROBE_MODELS, DEFAULT_TIER_PROBE_MODELS);
   const headerTimeoutMs = positiveMs(env.FREE_POOL_HEADER_TIMEOUT_MS, 90_000);
   const maxWaitMs = env.FREE_POOL_MAX_WAIT_MS === "0" ? 0 : positiveMs(env.FREE_POOL_MAX_WAIT_MS, 150_000);
   const lanes = [
-    ...(geminiKey && env.FREE_POOL_GEMINI !== "0"
+    ...(geminiEnabled
       ? geminiModels.map(model => ({ id: `gemini/${model}`, provider: "gemini", model })) : []),
     { id: "openrouter/free", provider: "openrouter", model: "openrouter/free" },
   ].map(lane => ({ ...lane, cooldownUntil: 0, reason: null, ok: 0, failed: 0, busy: false }));
   const tokens = new Map();
   const signatures = createSignatureCache();
-  const tier = { state: geminiKey ? "unverified" : "absent", checkedAt: 0, inFlight: null };
+  const tier = { state: geminiEnabled ? "unverified" : "absent", checkedAt: 0, inFlight: null };
   let server = null;
   let listening = null;
   let baseUrl = null;
@@ -259,7 +260,7 @@ export function createFreePool({
   }
 
   async function verifyGeminiTier(force = false) {
-    if (!geminiKey) return false;
+    if (!geminiEnabled) return false;
     const age = now() - tier.checkedAt;
     if (!force && tier.state === "free" && age < TIER_RECHECK_MS) return true;
     if (!force && tier.state !== "free" && tier.checkedAt && age < TIER_RETRY_MS) return false;
@@ -288,7 +289,7 @@ export function createFreePool({
   }
 
   function laneEnabled(lane) {
-    return lane.provider !== "gemini" || tier.state === "free";
+    return lane.provider !== "gemini" || (tier.state === "free" && now() - tier.checkedAt < TIER_RECHECK_MS);
   }
 
   function availableLanes(preferred) {
@@ -376,7 +377,7 @@ export function createFreePool({
     }
     const clientAbort = new AbortController();
     res.on("close", () => { if (!res.writableFinished) clientAbort.abort(); });
-    if (geminiKey && tier.state !== "free") await verifyGeminiTier();
+    if (geminiEnabled) await verifyGeminiTier();
     const attempted = [];
     let lastFailure = null;
     const waitDeadline = now() + maxWaitMs;
@@ -481,7 +482,7 @@ export function createFreePool({
         resolve(baseUrl);
       });
     });
-    if (geminiKey) void verifyGeminiTier();
+    if (geminiEnabled) void verifyGeminiTier();
     return listening;
   }
 

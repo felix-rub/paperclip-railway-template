@@ -126,6 +126,45 @@ test("Gemini lanes stay disabled unless the key is verified as free tier", async
   }
 });
 
+test("expired Gemini tier verification is renewed and disabled Gemini never sends probes", async () => {
+  let clock = Date.parse("2026-05-01T10:00:00Z");
+  let billed = false;
+  let probes = 0;
+  const providerCalls = [];
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (url === GEMINI && body.max_completion_tokens === 1) {
+      probes += 1;
+      return billed ? Response.json({ choices: [] }) : new Response(freeTier429, { status: 429 });
+    }
+    providerCalls.push(url);
+    return sse([{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]);
+  };
+  const pool = createFreePool({ env: { GEMINI_API_KEY: "g-key", FREE_POOL_GEMINI_MODELS: "m1" },
+    fetchImpl, log: () => {}, now: () => clock });
+  await pool.start();
+  try {
+    const token = pool.issueToken({ openrouterKey: "or-key" });
+    assert.equal((await post(pool, token, request())).lane, "gemini/m1");
+    billed = true;
+    clock += 6 * 3600 * 1000;
+    assert.equal(pool.status().lanes.find(l => l.id === "gemini/m1").enabled, false);
+    assert.equal((await post(pool, token, request())).lane, "openrouter/free");
+    assert.equal(probes, 2);
+    assert.equal(pool.status().geminiTier, "billed");
+    assert.deepEqual(providerCalls, [GEMINI, "https://openrouter.ai/api/v1/chat/completions"]);
+  } finally { await pool.close(); }
+  const before = probes;
+  const disabled = createFreePool({ env: { GEMINI_API_KEY: "g-key", FREE_POOL_GEMINI: "0" },
+    fetchImpl, log: () => {} });
+  await disabled.start();
+  try {
+    assert.equal(await disabled.verifyGeminiTier(true), false);
+    assert.equal((await post(disabled, disabled.issueToken({ openrouterKey: "or-key" }), request())).lane, "openrouter/free");
+    assert.equal(probes, before);
+  } finally { await disabled.close(); }
+});
+
 test("short per-minute cooldowns are waited out instead of failing the run", async () => {
   let clock = Date.parse("2026-05-01T10:00:00Z");
   let first = true;
