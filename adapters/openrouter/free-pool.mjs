@@ -30,6 +30,54 @@ const TIER_RECHECK_MS = 6 * 60 * 60 * 1000;
 const TIER_RETRY_MS = 10 * 60 * 1000;
 const SIGNATURE_CACHE_LIMIT = 20_000;
 const FORWARDED_OPENROUTER_HEADERS = ["http-referer", "x-title", "x-openrouter-title", "x-openrouter-categories"];
+const MAX_COMPLETION_BYTES = 8 * 1024 * 1024;
+
+class CompletionError extends Error {
+  constructor(status, message) {
+    super(message);
+    this.status = status;
+  }
+}
+
+async function readVerifiedCompletion(response) {
+  const chunks = [];
+  let bytes = 0;
+  for await (const chunk of response.body) {
+    bytes += chunk.byteLength;
+    if (bytes > MAX_COMPLETION_BYTES) throw new CompletionError(502, "Provider completion exceeded the 8 MiB limit");
+    chunks.push(Buffer.from(chunk));
+  }
+  const buffer = Buffer.concat(chunks);
+  const text = buffer.toString("utf8");
+  const streaming = response.headers.get("content-type")?.includes("text/event-stream");
+  const payloads = streaming
+    ? text.split(/\r?\n\r?\n/).map(event => event.split(/\r?\n/)
+      .filter(line => line.startsWith("data:")).map(line => line.slice(5).trimStart()).join("\n"))
+      .filter(data => data && data !== "[DONE]")
+    : [text];
+  let finished = false;
+  for (const payload of payloads) {
+    let data;
+    try { data = JSON.parse(payload); } catch { throw new CompletionError(502, "Invalid JSON in provider completion"); }
+    if (data.error) {
+      const code = Number(data.error.code);
+      throw new CompletionError(code >= 400 && code <= 599 ? code : 502, JSON.stringify({ error: data.error }));
+    }
+    for (const choice of data.choices ?? []) {
+      const reason = choice.finish_reason;
+      if (reason == null) continue;
+      if (/MALFORMED_FUNCTION_CALL|function_call_filter/i.test(String(reason))) {
+        throw new CompletionError(400, `Provider finish_reason: ${reason}`);
+      }
+      if (!["stop", "length", "tool_calls", "function_call", "content_filter"].includes(reason)) {
+        throw new CompletionError(502, `Unsupported provider finish_reason: ${reason}`);
+      }
+      finished = true;
+    }
+  }
+  if (!finished) throw new CompletionError(502, "Stream ended without finish_reason");
+  return buffer;
+}
 
 function parseList(value, fallback) {
   if (typeof value !== "string" || !value.trim()) return fallback;
@@ -333,90 +381,79 @@ export function createFreePool({
     let lastFailure = null;
     const waitDeadline = now() + maxWaitMs;
     for (;;) {
-    for (const lane of availableLanes(grant.lane)) {
-      if (clientAbort.signal.aborted) return res.end();
-      lane.busy = true;
-      const started = now();
-      const upstream = upstreamRequest(lane, body, grant, req.headers);
-      const headerTimer = new AbortController();
-      const timer = setTimeout(() => headerTimer.abort(), headerTimeoutMs);
-      timer.unref?.();
-      let response;
-      try {
-        response = await fetchImpl(upstream.url, {
-          method: "POST",
-          headers: upstream.headers,
-          body: JSON.stringify(upstream.body),
-          signal: AbortSignal.any([clientAbort.signal, headerTimer.signal]),
-        });
-      } catch (error) {
-        clearTimeout(timer);
-        lane.busy = false;
+      for (const lane of availableLanes(grant.lane)) {
         if (clientAbort.signal.aborted) return res.end();
-        const verdict = { failover: true, cooldownUntil: now() + TRANSIENT_COOLDOWN_MS, reason: "network",
-          message: String(error?.message ?? error).slice(0, 200) };
-        coolDown(lane, verdict);
-        attempted.push(`${lane.id}:network`);
-        lastFailure = { status: 503, message: verdict.message };
-        continue;
-      }
-      clearTimeout(timer);
-      if (!response.ok) {
-        const text = await response.text().catch(() => "");
-        const verdict = classifyFailure(lane, response.status, text, response.headers, now());
-        lane.busy = false;
-        attempted.push(`${lane.id}:${response.status}`);
-        lastFailure = { status: response.status, message: verdict.message };
-        if (verdict.failover) {
-          coolDown(lane, verdict);
-          continue;
-        }
-        lane.failed += 1;
-        emit({ event: "request", runId: grant.runId, lane: lane.id, status: response.status, ms: now() - started,
-          attempted, message: verdict.message });
-        return sendJson(res, response.status, { error: { code: response.status, message: `${lane.id}: ${verdict.message}` } });
-      }
-      lane.ok += 1;
-      grant.lane = lane.id;
-      res.writeHead(200, {
-        "Content-Type": response.headers.get("content-type") ?? "application/json",
-        "Cache-Control": "no-cache",
-        "X-Free-Pool-Lane": lane.id,
-      });
-      let tail = "";
-      try {
-        for await (const chunk of response.body) {
-          const text = Buffer.from(chunk).toString("utf8");
-          if (lane.provider === "gemini") {
-            const combined = tail + text;
-            const cut = combined.lastIndexOf("\n");
-            if (cut >= 0) {
-              recordResponseSignatures(combined.slice(0, cut));
-              tail = combined.slice(cut + 1);
-            } else {
-              tail = combined;
+        // Another request may have claimed this lane while an earlier attempt awaited I/O.
+        if (lane.busy || !laneEnabled(lane) || lane.cooldownUntil > now()) continue;
+        lane.busy = true;
+        const started = now();
+        const headerTimer = new AbortController();
+        const timer = setTimeout(() => headerTimer.abort(), headerTimeoutMs);
+        timer.unref?.();
+        try {
+          const upstream = upstreamRequest(lane, body, grant, req.headers);
+          const response = await fetchImpl(upstream.url, {
+            method: "POST",
+            headers: upstream.headers,
+            body: JSON.stringify(upstream.body),
+            signal: AbortSignal.any([clientAbort.signal, headerTimer.signal]),
+          });
+          if (!response.ok) {
+            const text = await response.text();
+            const verdict = classifyFailure(lane, response.status, text, response.headers, now());
+            attempted.push(`${lane.id}:${response.status}`);
+            lastFailure = { status: response.status, message: verdict.message };
+            if (verdict.failover) {
+              coolDown(lane, verdict);
+              continue;
             }
+            lane.failed += 1;
+            emit({ event: "request", runId: grant.runId, lane: lane.id, status: response.status, ms: now() - started,
+              attempted, message: verdict.message });
+            return sendJson(res, response.status, { error: { code: response.status, message: `${lane.id}: ${verdict.message}` } });
           }
-          if (!res.write(chunk)) await new Promise(resolve => res.once("drain", resolve));
+          // Buffer one completion, not the whole agent run: never expose partial tool
+          // calls before knowing whether replay on another lane is necessary.
+          const completion = await readVerifiedCompletion(response);
+          if (clientAbort.signal.aborted) return res.end();
+          lane.ok += 1;
+          grant.lane = lane.id;
+          if (lane.provider === "gemini") recordResponseSignatures(completion.toString("utf8"));
+          res.writeHead(200, {
+            "Content-Type": response.headers.get("content-type") ?? "application/json",
+            "Cache-Control": "no-cache",
+            "X-Free-Pool-Lane": lane.id,
+          });
+          res.end(completion);
+          emit({ event: "request", runId: grant.runId, agentId: grant.agentId, lane: lane.id, status: 200,
+            ms: now() - started, attempted });
+          return undefined;
+        } catch (error) {
+          if (clientAbort.signal.aborted) return res.end();
+          const status = error instanceof CompletionError ? error.status : 503;
+          const text = String(error?.message ?? error);
+          const verdict = classifyFailure(lane, status, text, null, now());
+          attempted.push(`${lane.id}:${status}`);
+          lastFailure = { status, message: verdict.message };
+          emit({ event: "completion_error", runId: grant.runId, lane: lane.id, status, message: verdict.message });
+          if (!verdict.failover) {
+            lane.failed += 1;
+            return sendJson(res, status, { error: { code: status, message: `${lane.id}: ${verdict.message}` } });
+          }
+          coolDown(lane, verdict);
+        } finally {
+          clearTimeout(timer);
+          lane.busy = false;
         }
-        if (tail) recordResponseSignatures(tail);
-      } catch (error) {
-        emit({ event: "stream_error", runId: grant.runId, lane: lane.id, message: String(error?.message ?? error).slice(0, 200) });
       }
-      lane.busy = false;
-      res.end();
-      emit({ event: "request", runId: grant.runId, agentId: grant.agentId, lane: lane.id, status: 200,
-        ms: now() - started, attempted });
-      return undefined;
-    }
-    // Per-minute limits clear quickly; hold the request instead of failing the run
-    // (which would push it to the next hourly retry).
-    const busyLane = lanes.some(lane => laneEnabled(lane) && lane.cooldownUntil <= now() && lane.busy);
-    const nextFree = exhaustedUntil() || (busyLane ? now() + 250 : 0);
-    if (!nextFree || nextFree > waitDeadline || clientAbort.signal.aborted) break;
-    emit({ event: "waiting", runId: grant.runId, until: new Date(nextFree).toISOString() });
-    await sleep(Math.max(0, nextFree - now()) + 250, clientAbort.signal);
-    if (clientAbort.signal.aborted) return res.end();
+      // Per-minute limits clear quickly; hold the request instead of failing the run
+      // (which would push it to the next hourly retry).
+      const busyLane = lanes.some(lane => laneEnabled(lane) && lane.cooldownUntil <= now() && lane.busy);
+      const nextFree = exhaustedUntil() || (busyLane ? now() + 250 : 0);
+      if (!nextFree || nextFree > waitDeadline || clientAbort.signal.aborted) break;
+      emit({ event: "waiting", runId: grant.runId, until: new Date(nextFree).toISOString() });
+      await sleep(Math.max(0, nextFree - now()) + 250, clientAbort.signal);
+      if (clientAbort.signal.aborted) return res.end();
     }
     const until = exhaustedUntil();
     const retryAt = until ? new Date(until).toISOString() : null;
@@ -463,9 +500,9 @@ export function createFreePool({
       return {
         geminiTier: tier.state,
         exhaustedUntil: exhaustedUntil() || null,
-        lanes: lanes.map(({ id, cooldownUntil, reason, ok, failed }) => ({
+        lanes: lanes.map(({ id, cooldownUntil, reason, ok, failed, busy }) => ({
           id, enabled: laneEnabled(lanes.find(lane => lane.id === id)),
-          cooldownUntil: cooldownUntil > now() ? new Date(cooldownUntil).toISOString() : null, reason, ok, failed,
+          cooldownUntil: cooldownUntil > now() ? new Date(cooldownUntil).toISOString() : null, reason, ok, failed, busy,
         })),
       };
     },

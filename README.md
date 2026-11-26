@@ -59,6 +59,11 @@ each exhausted lane until its quota window or for at most one hour.
   agents, and spreads concurrent requests across distinct provider lanes.
   Three quota errors in ten minutes throttle concurrency back to one worker per
   queued company until the provider settles.
+- **Completion validation:** each completion is buffered (up to 8 MiB) until a
+  valid finish reason arrives. Malformed tool calls, broken streams and embedded
+  provider errors fail over before partial output can reach the agent. The
+  `FREE_POOL_HEADER_TIMEOUT_MS` deadline (default 90 seconds) now covers the
+  response body too. Incremental output appears after each verified completion.
 - **Secrets:** Pi receives only a per-run gateway token. The real OpenRouter and
   Gemini keys are not passed to Pi or its tool subprocesses.
 - **Privacy:** Google may use free-tier Gemini prompts to improve its products.
@@ -83,7 +88,11 @@ This Railway instance enforces `openrouter` with saved model `openrouter/free`
 for new hires and configuration changes, independent of company. On startup,
 existing non-terminated agents in non-archived companies are repaired too.
 Provider/paid fallback overrides and managed AI-connection bindings are removed;
-instructions, workspace, heartbeat settings and secret references are preserved.
+instructions, workspace and secret references are preserved. Each agent runs
+one task at a time; the four shared workers still allow parallelism across agents.
+Enabled timers run no more often than hourly, with at least a 60-second cooldown,
+and skip ticks without actionable work. Disabled timers and on-demand wakeups
+are preserved. These bounds prevent overlapping sessions and idle polling churn.
 A database trigger applies the same policy to imports and future companies,
 so stale GPT-4o defaults cannot be persisted. Archived agents are not bulk migrated.
 Free-provider quota limits still apply; a correct saved model does not guarantee

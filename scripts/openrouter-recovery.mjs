@@ -14,6 +14,13 @@ export function normalizeFreeAgentConfiguration(input, existing = {}) {
   adapterConfig.model = "openrouter/free";
   const runtimeConfig = { ...(input.runtimeConfig ?? existing.runtimeConfig ?? {}) };
   delete runtimeConfig.aiConnection;
+  const heartbeat = { ...runtimeConfig.heartbeat, maxConcurrentRuns: 1 };
+  if (heartbeat.enabled === true) {
+    heartbeat.intervalSec = Math.max(3600, Number(heartbeat.intervalSec) || 0);
+    heartbeat.cooldownSec = Math.max(60, Number(heartbeat.cooldownSec) || 0);
+    heartbeat.skipTimerWhenNoActionableWork = true;
+  }
+  runtimeConfig.heartbeat = heartbeat;
   return { ...input, adapterType: "openrouter", adapterConfig, runtimeConfig };
 }
 
@@ -30,12 +37,25 @@ export async function enforceFreeAgentDefaults(db, sql, logger) {
     $policy$;
   `));
   await db.execute(sql.raw(`
+    create or replace function paperclip_free_agent_runtime(config jsonb) returns jsonb
+    language sql immutable as $policy$
+      select (coalesce(config, '{}'::jsonb) - 'aiConnection') ||
+        jsonb_build_object('heartbeat', coalesce(config->'heartbeat', '{}'::jsonb) ||
+          '{"maxConcurrentRuns":1}'::jsonb ||
+          case when config->'heartbeat'->>'enabled' = 'true' then jsonb_build_object(
+            'intervalSec', greatest(3600, (config->'heartbeat'->>'intervalSec')::numeric),
+            'cooldownSec', greatest(60, (config->'heartbeat'->>'cooldownSec')::numeric),
+            'skipTimerWhenNoActionableWork', true
+          ) else '{}'::jsonb end)
+    $policy$;
+  `));
+  await db.execute(sql.raw(`
     create or replace function paperclip_enforce_free_agent() returns trigger
     language plpgsql as $policy$
     begin
       new.adapter_type := 'openrouter';
       new.adapter_config := paperclip_free_agent_config(new.adapter_config);
-      new.runtime_config := coalesce(new.runtime_config, '{}'::jsonb) - 'aiConnection';
+      new.runtime_config := paperclip_free_agent_runtime(new.runtime_config);
       return new;
     end
     $policy$;
@@ -49,20 +69,20 @@ export async function enforceFreeAgentDefaults(db, sql, logger) {
     update agents a
     set adapter_type = 'openrouter',
         adapter_config = paperclip_free_agent_config(a.adapter_config),
-        runtime_config = coalesce(a.runtime_config, '{}'::jsonb) - 'aiConnection',
+        runtime_config = paperclip_free_agent_runtime(a.runtime_config),
         updated_at = now()
     from companies c
     where c.id = a.company_id and c.status <> 'archived' and a.status <> 'terminated'
       and (a.adapter_type <> 'openrouter'
         or a.adapter_config is distinct from paperclip_free_agent_config(a.adapter_config)
-        or a.runtime_config ? 'aiConnection')
+        or a.runtime_config is distinct from paperclip_free_agent_runtime(a.runtime_config))
     returning a.id, a.company_id
   `);
   const inventory = await db.execute(sql`
     select c.id as company_id, c.name as company_name, count(*)::int as agents,
       count(*) filter (where a.adapter_type = 'openrouter'
         and a.adapter_config->>'model' = 'openrouter/free'
-        and not (a.runtime_config ? 'aiConnection'))::int as free_agents
+        and a.runtime_config = paperclip_free_agent_runtime(a.runtime_config))::int as free_agents
     from companies c join agents a on a.company_id = c.id
     where c.status <> 'archived' and a.status <> 'terminated'
     group by c.id, c.name order by c.name
@@ -947,27 +967,16 @@ export async function reconcileOpenRouterControlPlane(db, sql, logger) {
 
   await db.execute(sql`
     update routine_triggers t
-    set cron_expression = case t.routine_id::text
-          when 'bb3dab66-a107-4f1f-9f7b-7b305f25e3e2' then '0 4 * * 1,3,5'
-          when '3bd6a48e-f2ae-4084-9eb0-15cf864e35e6' then '0 7 1,15 * *'
-          when 'a676e35a-a726-4667-8c06-4bb874c8f5e2' then '0 8 * * 1'
-          else t.cron_expression
-        end,
-        enabled = case
-          when t.routine_id::text = 'a676e35a-a726-4667-8c06-4bb874c8f5e2' then true
-          else t.enabled
-        end,
-        next_run_at = case
-          when t.routine_id::text = 'a676e35a-a726-4667-8c06-4bb874c8f5e2' then now() + interval '1 day'
-          else t.next_run_at
-        end,
+    set cron_expression = desired.cron,
         updated_at = now()
+    from (values
+      ('bb3dab66-a107-4f1f-9f7b-7b305f25e3e2', '0 4 * * 1,3,5'),
+      ('3bd6a48e-f2ae-4084-9eb0-15cf864e35e6', '0 7 1,15 * *'),
+      ('a676e35a-a726-4667-8c06-4bb874c8f5e2', '0 8 * * 1')
+    ) as desired(routine_id, cron)
     where t.kind = 'schedule'
-      and t.routine_id::text in (
-        'bb3dab66-a107-4f1f-9f7b-7b305f25e3e2',
-        '3bd6a48e-f2ae-4084-9eb0-15cf864e35e6',
-        'a676e35a-a726-4667-8c06-4bb874c8f5e2'
-      )
+      and t.routine_id::text = desired.routine_id
+      and t.cron_expression is distinct from desired.cron
   `);
   const throttledRes = await db.execute(sql`
     update routine_triggers t

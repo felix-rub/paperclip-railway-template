@@ -40,15 +40,26 @@ test("free agent defaults replace paid routing without losing instructions or he
       model: "openrouter/free", instructionsFilePath: "/work/AGENTS.md", cwd: "/work",
       timeoutSec: 240, env: input.adapterConfig.env,
     },
-    runtimeConfig: { heartbeat: { intervalSec: 3600 } },
+    runtimeConfig: { heartbeat: { intervalSec: 3600, maxConcurrentRuns: 1 } },
   });
   assert.equal(input.adapterConfig.model, "openai/gpt-4o");
   assert.deepEqual(normalizeFreeAgentConfiguration(normalized), normalized);
   assert.deepEqual(normalizeFreeAgentConfiguration({}), {
-    adapterType: "openrouter", adapterConfig: { model: "openrouter/free" }, runtimeConfig: {},
+    adapterType: "openrouter", adapterConfig: { model: "openrouter/free" }, runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
   });
   assert.deepEqual(normalizeFreeAgentConfiguration({ name: "renamed" }, normalized),
     { ...normalized, name: "renamed" });
+  const timer = normalizeFreeAgentConfiguration({ runtimeConfig: {
+    heartbeat: { enabled: true, intervalSec: 300, cooldownSec: 10, maxConcurrentRuns: 20, wakeOnDemand: true },
+  } }).runtimeConfig.heartbeat;
+  assert.deepEqual(timer, {
+    enabled: true, intervalSec: 3600, cooldownSec: 60, maxConcurrentRuns: 1,
+    wakeOnDemand: true, skipTimerWhenNoActionableWork: true,
+  });
+  const disabled = normalizeFreeAgentConfiguration({ runtimeConfig: {
+    heartbeat: { enabled: false, wakeOnDemand: true },
+  } }).runtimeConfig.heartbeat;
+  assert.deepEqual(disabled, { enabled: false, wakeOnDemand: true, maxConcurrentRuns: 1 });
 });
 
 test("database policy repairs both orgs and enforces future inserts/imports/updates", {
@@ -72,8 +83,8 @@ test("database policy repairs both orgs and enforces future inserts/imports/upda
         );
         insert into companies values ('fe','FE','active'), ('fefe','Fefe GmbH','active'), ('archive','Old','archived');
         insert into agents (id,company_id,adapter_type,adapter_config,runtime_config) values
-          ('fe-agent','fe','openrouter','{"model":"openrouter/free","cwd":"/work"}','{"heartbeat":{"intervalSec":3600}}'),
-          ('fefe-agent','fefe','paperclip_runner','{"model":"gpt-4o","provider":"openai","instructionsFilePath":"/work/AGENTS.md"}','{"aiConnection":{"mode":"router"}}'),
+          ('fe-agent','fe','openrouter','{"model":"openrouter/free","cwd":"/work"}','{"heartbeat":{"intervalSec":3600,"maxConcurrentRuns":1}}'),
+          ('fefe-agent','fefe','paperclip_runner','{"model":"gpt-4o","provider":"openai","instructionsFilePath":"/work/AGENTS.md"}','{"aiConnection":{"mode":"router"},"heartbeat":{"enabled":true,"intervalSec":600,"cooldownSec":10,"maxConcurrentRuns":20,"wakeOnDemand":true}}'),
           ('archived-agent','archive','process','{}','{}');
       `));
       const logs = [];
@@ -87,7 +98,9 @@ test("database policy repairs both orgs and enforces future inserts/imports/upda
       assert.deepEqual(rows.find(r => r.id === "fefe-agent").adapter_config,
         { model: "openrouter/free", instructionsFilePath: "/work/AGENTS.md" });
       assert.deepEqual(rows.find(r => r.id === "fe-agent").runtime_config,
-        { heartbeat: { intervalSec: 3600 } });
+        { heartbeat: { intervalSec: 3600, maxConcurrentRuns: 1 } });
+      assert.deepEqual(rows.find(r => r.id === "fefe-agent").runtime_config.heartbeat,
+        { enabled: true, intervalSec: 3600, cooldownSec: 60, maxConcurrentRuns: 1, wakeOnDemand: true, skipTimerWhenNoActionableWork: true });
       await tx.execute(sql.raw(`
         insert into companies values ('future','Future org','active');
         insert into agents (id,company_id) values ('new-default','future');
@@ -104,10 +117,11 @@ test("database policy repairs both orgs and enforces future inserts/imports/upda
         assert.equal(agent.adapter_config.provider, undefined);
         assert.equal(agent.adapter_config.fallbackModels, undefined);
         assert.equal(agent.runtime_config.aiConnection, undefined);
+        assert.equal(agent.runtime_config.heartbeat.maxConcurrentRuns, 1);
       }
       assert.equal(future.find(a => a.id === "imported").adapter_config.cwd, "/new");
       await enforceFreeAgentDefaults(tx, sql, { info() { assert.fail("policy must install once"); } });
-      await tx.execute(sql.raw("drop function paperclip_enforce_free_agent() cascade; drop function paperclip_free_agent_config(jsonb);"));
+      await tx.execute(sql.raw("drop function paperclip_enforce_free_agent() cascade; drop function paperclip_free_agent_config(jsonb); drop function paperclip_free_agent_runtime(jsonb);"));
     });
   } finally {
     await closeRegisteredClients(url.href);
@@ -252,6 +266,9 @@ test("control-plane cleanup uses SQL predicates instead of Drizzle UUID array in
   assert.doesNotMatch(queries.map(query => query.text).join("\n"), /any\(\?/);
   assert.doesNotMatch(queries.map(query => query.text).join("\n"), /lower\(coalesce\(r\.title[\s\S]*?~ \?/);
   assert.equal(queries.some(query => query.values.some(Array.isArray)), false);
+  const cron = queries.find(query => query.text.includes("set cron_expression"));
+  assert.match(cron.text, /cron_expression is distinct from desired.cron/);
+  assert.doesNotMatch(cron.text, /next_run_at\s*=|enabled\s*=/);
 });
 
 test("control-plane cleanup failure cannot block scheduler or retry recovery", async () => {
@@ -433,7 +450,7 @@ test("reconcileOpenRouterRetries unparks verifying agents, heals paused ready ag
       if (query.text.includes("from routines r")) return { rows: [] };
       if (query.text.includes("with target_issues as")) return { rows: [] };
       if (query.text.includes("with queued as")) return { rows: [] };
-      if (query.text.includes("set cron_expression = case")) return { rows: [] };
+      if (query.text.includes("set cron_expression = desired.cron")) return { rows: [] };
       if (query.text.includes("deferred_openrouter_backlog")) return { rows: [] };
       if (query.text.includes("delete from routines")) return { rows: [] };
       if (query.text.includes("count(distinct a.id)")) return { rows: [] };

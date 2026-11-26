@@ -41,7 +41,8 @@ test("pool fails over across free lanes, replays Gemini thought signatures and g
     if (url === GEMINI && body.model === "m2") {
       if (body.messages.length === 1) {
         return sse([{ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: "call-1", type: "function",
-          function: { name: "read", arguments: "{}" }, extra_content: { google: { thought_signature: "SIG-1" } } }] } }] }]);
+          function: { name: "read", arguments: "{}" }, extra_content: { google: { thought_signature: "SIG-1" } } }] },
+          finish_reason: "tool_calls" }] }]);
       }
       return sse([{ choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }] }]);
     }
@@ -172,6 +173,102 @@ test("concurrent requests spread across distinct ready provider lanes", async ()
   } finally {
     await pool.close();
   }
+});
+
+test("malformed and truncated HTTP-200 completions fail over before exposing partial tool calls", async t => {
+  for (const [name, failedResponse] of [
+    ["malformed", () => sse([{ choices: [{ delta: { tool_calls: [{ function: { name: "broken" } }] },
+      finish_reason: "function_call_filter: MALFORMED_FUNCTION_CALL" }] }])],
+    ["truncated", () => sse([{ choices: [{ delta: { content: "partial-bad-output" } }] }])],
+    ["invalid-json", () => new Response("data: {broken}\n\n", { headers: { "content-type": "text/event-stream" } })],
+    ["embedded-error", () => sse([{ error: { code: 503, message: "provider unavailable" } }])],
+  ]) {
+    await t.test(name, async () => {
+      const { calls, fetchImpl } = fakeUpstream({ handlers: (url, body) => body.model === "m1"
+        ? failedResponse() : sse([{ choices: [{ delta: { content: "verified" }, finish_reason: "stop" }] }]) });
+      const pool = createFreePool({ env: { GEMINI_API_KEY: "g-key", FREE_POOL_GEMINI_MODELS: "m1,m2", FREE_POOL_MAX_WAIT_MS: "0" },
+        fetchImpl, log: () => {} });
+      await pool.start();
+      try {
+        const result = await post(pool, pool.issueToken({ openrouterKey: "or-key" }), request());
+        assert.equal(result.status, 200);
+        assert.equal(result.lane, "gemini/m2");
+        assert.match(result.text, /verified/);
+        assert.doesNotMatch(result.text, /broken|partial-bad-output|MALFORMED/);
+        assert.deepEqual(calls.map(c => c.body.model), ["m1", "m2"]);
+        assert.equal(pool.status().lanes.find(l => l.id === "gemini/m1").failed, 1);
+        assert.ok(pool.status().lanes.every(l => !l.busy));
+      } finally { await pool.close(); }
+    });
+  }
+});
+
+test("failover rechecks lane ownership while another request is in flight", { timeout: 5000 }, async t => {
+  let releaseFirst;
+  let releaseSecond;
+  let markFirst;
+  const firstStarted = new Promise(resolve => { markFirst = resolve; });
+  const firstGate = new Promise(resolve => { releaseFirst = resolve; });
+  const secondGate = new Promise(resolve => { releaseSecond = resolve; });
+  t.signal.addEventListener("abort", () => { releaseFirst(); releaseSecond(); }, { once: true });
+  let secondClaims = 0;
+  let racing = false;
+  const { fetchImpl } = fakeUpstream({ handlers: async (url, body) => {
+    if (racing && body.model === "m1") {
+      markFirst();
+      await firstGate;
+      return new Response("{}", { status: 503 });
+    }
+    if (racing && body.model === "m2") {
+      secondClaims += 1;
+      releaseFirst();
+      await secondGate;
+    } else if (racing) {
+      releaseSecond();
+    }
+    return sse([{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]);
+  } });
+  const pool = createFreePool({ env: { GEMINI_API_KEY: "g-key", FREE_POOL_GEMINI_MODELS: "m1,m2" }, fetchImpl, log: () => {} });
+  await pool.start();
+  try {
+    const firstToken = pool.issueToken({ openrouterKey: "or-key" });
+    const secondToken = pool.issueToken({ openrouterKey: "or-key" });
+    assert.equal((await post(pool, firstToken, request())).lane, "gemini/m1");
+    assert.equal((await post(pool, secondToken, request())).lane, "gemini/m2");
+    racing = true;
+    const first = post(pool, firstToken, request());
+    await firstStarted;
+    const second = post(pool, secondToken, request());
+    const results = await Promise.all([first, second]);
+    assert.equal(secondClaims, 1);
+    assert.deepEqual(results.map(r => r.lane), ["openrouter/free", "gemini/m2"]);
+    assert.ok(pool.status().lanes.every(l => !l.busy));
+  } finally { releaseFirst(); releaseSecond(); await pool.close(); }
+});
+
+test("stalled response bodies time out and release the lane for failover", { timeout: 5000 }, async () => {
+  const { fetchImpl: normalFetch } = fakeUpstream({ handlers: () =>
+    sse([{ choices: [{ delta: { content: "ok" }, finish_reason: "stop" }] }]) });
+  const fetchImpl = async (url, init) => {
+    const body = JSON.parse(init.body);
+    if (body.model === "m1" && body.max_completion_tokens !== 1) {
+      return new Response(new ReadableStream({
+        start(controller) {
+          init.signal.addEventListener("abort", () => controller.error(new Error("body timed out")), { once: true });
+        },
+      }), { headers: { "content-type": "text/event-stream" } });
+    }
+    return normalFetch(url, init);
+  };
+  const pool = createFreePool({ env: { GEMINI_API_KEY: "g-key", FREE_POOL_GEMINI_MODELS: "m1,m2", FREE_POOL_HEADER_TIMEOUT_MS: "50" },
+    fetchImpl, log: () => {} });
+  await pool.start();
+  try {
+    const result = await post(pool, pool.issueToken({ openrouterKey: "or-key" }), request());
+    assert.equal(result.status, 200);
+    assert.equal(result.lane, "gemini/m2");
+    assert.ok(pool.status().lanes.every(l => !l.busy));
+  } finally { await pool.close(); }
 });
 
 test("classifies failures and sanitizes Gemini payloads", () => {
